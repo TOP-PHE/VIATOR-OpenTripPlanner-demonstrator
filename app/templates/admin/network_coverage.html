@@ -2275,9 +2275,10 @@ function renderModalOebbLeg(leg) {
 
 // The stations of the module ÖBB's stop numbers are linked to, per page
 // (number → station, or null when no station carries it), from POST
-// /api/admin/network-coverage/oebb-stops/resolve; and the series it named.
+// /api/admin/network-coverage/oebb-stops/resolve; and the series it asked,
+// in their order (a station names the one it was found in).
 const OEBB_STOP_STATIONS = new Map();
-let OEBB_STOP_SERIES = null;
+let OEBB_STOP_SERIES = [];
 const OEBB_STOPS_PER_CALL = 40;
 
 // Ask for the numbers of the modal's ÖBB stops not known yet (at most 40),
@@ -2296,7 +2297,7 @@ async function resolveModalOebbStops(root) {
       });
       if (r.ok) {
         const answer = await r.json();
-        OEBB_STOP_SERIES = answer.series || null;
+        OEBB_STOP_SERIES = Array.isArray(answer.series) ? answer.series : [];
         Object.entries(answer.stations || {}).forEach(([number, station]) => {
           OEBB_STOP_STATIONS.set(number, station);
         });
@@ -2318,7 +2319,7 @@ function oebbStopTitle(number, oebbName, station) {
   parts.push('station module: ' + station.name + (station.uic ? ', MERITS ' + station.uic : ', no MERITS code')
     + (link.length ? ' (' + link.join(', ') + ')' : ''));
   if (station.others) parts.push(station.others + ' more station(s) carry this number');
-  if (OEBB_STOP_SERIES) parts.push('series ' + OEBB_STOP_SERIES);
+  if (station.series) parts.push('series ' + station.series);
   return parts.join(' · ');
 }
 
@@ -2339,7 +2340,7 @@ function applyOebbStopStation(span) {
   span.classList.add('unmapped');
   span.title = 'ÖBB stop number ' + number + (oebbName ? ' (ÖBB: ' + oebbName + ')' : '')
     + ': no station of the station module carries it'
-    + (OEBB_STOP_SERIES ? ' in series ' + OEBB_STOP_SERIES : '');
+    + (OEBB_STOP_SERIES.length ? ' in series ' + OEBB_STOP_SERIES.join(' or ') : '');
 }
 
 // PR-196b — build the side-by-side VIATOR vs ÖBB grid for one

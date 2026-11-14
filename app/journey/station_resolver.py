@@ -17,14 +17,19 @@ Nothing compares `station_id` yet: the matching engine of #304 will (its design 
   * an OTP stop (`otp:<feed>`, `<feed>:<local>`): the provider of that id, the stop itself;
   * an ÖBB HAFAS stop (`hafas:oebb`): its number (`extId`, else the number of its `UIC:` or
     `OEBB:` token, as the coverage cell modal asks it) in the code series of
-    `COVERAGE_OEBB_STOP_SERIES` (`DELFI_stop_key`: measured 27 Oct, CLAUDE.md §3);
+    `COVERAGE_OEBB_STOP_SERIES`, in their order (`DELFI_stop_key`: measured 27 Oct, CLAUDE.md §3;
+    then `Trainline_EVA`, the module's design 22.19, for the numbers outside Germany and
+    Austria); a series is asked only for the numbers the series before it places nowhere (the
+    module's decision 72), so a code of several stations in one series is never settled by the
+    next;
   * anything else (an OJP stop, a provider with no feed key: a derived feed, an upload whose
     file is unknown): not asked.
 
 **What is kept**: a key answered with exactly one station gives it; a code of several stations
-gives none (the matching treats it as unknown). Every answer, a key placed nowhere included,
-is kept `CACHE_SECONDS` in this process (`_cache`), so a coverage run or a search asks each
-stop once a while; a call that failed keeps nothing, and asks no more in that resolution.
+gives none (the matching treats it as unknown). Every answer, a key placed nowhere and a key of
+several stations included, is kept `CACHE_SECONDS` in this process (`_cache`), so a coverage
+run or a search asks each stop once a while; a call that failed keeps nothing, and asks no more
+in that resolution.
 
 **Never fails**: the module off, paused, at its ceiling or not answering leaves the stops it
 did not place without a station, and the engine falls back to codes (design #304 §6). Nothing
@@ -40,6 +45,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 from .. import station_module
@@ -67,28 +73,49 @@ CODE = "code"
 clock: Callable[[], float] = time.monotonic
 
 
+class Unplaced(Enum):
+    """An answer of the module that gives a key no station."""
+
+    NOWHERE = "nowhere"  # no station carries the key
+    SEVERAL = "several"  # several stations carry it: which one is unknown
+
+
+# The module's answer to a key: its one station, or why it gives none.
+Answer = ResolvedStation | Unplaced
+
+
+def oebb_stop_series(value: object) -> tuple[str, ...]:
+    """The code series of `COVERAGE_OEBB_STOP_SERIES`, in the order they are asked: its names
+    separated by commas, trimmed, each once (`"DELFI_stop_key,Trainline_EVA"`; one name alone
+    is one series). None for an empty setting: ÖBB's stops are then left out."""
+    if not isinstance(value, str):
+        return ()
+    return tuple(dict.fromkeys(name.strip() for name in value.split(",") if name.strip()))
+
+
 class _Cache:
-    """The module's answers, by key: a station, or None for a key placed nowhere; each kept
-    `CACHE_SECONDS`, the oldest dropped beyond `CACHE_MAX`. Under one lock: a coverage run
-    resolves in the worker's executor thread, a search on the web's event loop."""
+    """The module's answers, by key, each kept `CACHE_SECONDS`, the oldest dropped beyond
+    `CACHE_MAX`. Under one lock: a coverage run resolves in the worker's executor thread, a
+    search on the web's event loop."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._entries: OrderedDict[ModuleKey, tuple[float, ResolvedStation | None]] = OrderedDict()
+        self._entries: OrderedDict[ModuleKey, tuple[float, Answer]] = OrderedDict()
 
-    def get(self, key: ModuleKey) -> tuple[bool, ResolvedStation | None]:
+    def get(self, key: ModuleKey) -> Answer | None:
+        """The answer kept for `key`, or None when none is kept."""
         with self._lock:
             entry = self._entries.get(key)
             if entry is None:
-                return False, None
+                return None
             if entry[0] <= clock():
                 del self._entries[key]
-                return False, None
-            return True, entry[1]
+                return None
+            return entry[1]
 
-    def put(self, key: ModuleKey, station: ResolvedStation | None) -> None:
+    def put(self, key: ModuleKey, answer: Answer) -> None:
         with self._lock:
-            self._entries[key] = (clock() + CACHE_SECONDS, station)
+            self._entries[key] = (clock() + CACHE_SECONDS, answer)
             self._entries.move_to_end(key)
             while len(self._entries) > CACHE_MAX:
                 self._entries.popitem(last=False)
@@ -157,10 +184,10 @@ def _token_number(token: str | None) -> str | None:
 
 
 def keys_of(
-    stop: CanonicalStopPlace, feeds: SessionFeeds, oebb_series: str | None
+    stop: CanonicalStopPlace, feeds: SessionFeeds, oebb_series: tuple[str, ...]
 ) -> list[ModuleKey]:
     """The keys `stop` is asked by, the one to trust first first; none when the module cannot
-    know it."""
+    know it. An ÖBB stop's are its number in each series of `oebb_series`, in their order."""
     if stop.source.startswith(MOTIS_PREFIX):
         dataset = stop.source[len(MOTIS_PREFIX) :]
         feed = feeds.motis.get(dataset)
@@ -173,9 +200,9 @@ def keys_of(
         feed = feeds.otp.get(feed_id)
         local = _local(stop.ref, feed_id, ":") if feed is not None else None
         return [] if feed is None or local is None else [(STOP, feed, local)]
-    if stop.source == OEBB_SOURCE and oebb_series is not None:
+    if stop.source == OEBB_SOURCE and oebb_series:
         number = _oebb_number(stop)
-        return [] if number is None else [(CODE, oebb_series, number)]
+        return [] if number is None else [(CODE, series, number) for series in oebb_series]
     return []
 
 
@@ -213,28 +240,52 @@ async def _ask(kind: str, owner: str, values: list[str]) -> station_module.Outco
     return await station_module.stop_stations_outcome(series=owner, codes=values)
 
 
-def _stations_of(rows: Sequence[Mapping[str, Any]]) -> dict[str, ResolvedStation | None]:
-    """Each key's station: the one station the module answered, or None for a key of several."""
+def _stations_of(rows: Sequence[Mapping[str, Any]]) -> dict[str, Answer]:
+    """Each answered key's station: the one station the module answered, or `SEVERAL`; a key
+    with no row is not in it (placed nowhere)."""
     found: dict[str, dict[str, str | None]] = {}
     for row in rows:
         found.setdefault(row["key"], {})[row["viator_id"]] = row["parent_viator_id"]
-    stations: dict[str, ResolvedStation | None] = {}
+    stations: dict[str, Answer] = {}
     for key, ids in found.items():
         if len(ids) == 1:
             ((vid, parent),) = ids.items()
             stations[key] = ResolvedStation(station_id=vid, parent_id=parent)
         else:
-            stations[key] = None
+            stations[key] = Unplaced.SEVERAL
     return stations
 
 
+def _walk(
+    keys: Sequence[ModuleKey], answers: Mapping[ModuleKey, Answer]
+) -> tuple[ResolvedStation | None, list[ModuleKey]]:
+    """The station a stop's `keys` give with the `answers` known, and the keys to ask before it
+    is settled. The keys are trusted in their order: the first with one station gives it. A
+    feed's stop keys not known yet are asked together; a code (ÖBB's number in a series) only
+    once the code before it is known to be placed nowhere, and a code of several stations ends
+    the list: the next series answers only where the one before is silent (the module's
+    decision 72)."""
+    to_ask: list[ModuleKey] = []
+    for key in keys:
+        answer = answers.get(key)
+        if answer is None:
+            to_ask.append(key)
+            if key[0] == CODE:
+                break
+        elif isinstance(answer, ResolvedStation):
+            return answer, to_ask
+        elif answer is Unplaced.SEVERAL and key[0] == CODE:
+            break
+    return None, to_ask
+
+
 def resolver_for_session(
-    config: Mapping[str, Any], upload_sha256: Mapping[str, str], oebb_series: str | None
+    config: Mapping[str, Any], upload_sha256: Mapping[str, str], oebb_series: tuple[str, ...]
 ) -> ModuleStationResolver:
     """The resolver of a session's journeys: its `config` (`sessions.config`), the sha256 of
     the latest file uploaded for each provider (`station_extract_upload.latest_upload_sha256`)
-    and the code series of ÖBB's numbers. A configuration that does not read gives a resolver
-    that places only ÖBB's stops."""
+    and the code series of ÖBB's numbers, in their order (`oebb_stop_series`). A configuration
+    that does not read gives a resolver that places only ÖBB's stops."""
     from .. import ingestion, station_extract
 
     try:
@@ -252,36 +303,41 @@ def resolver_for_session(
 
 class ModuleStationResolver:
     """The `StationResolver` of one session's journeys (its feeds) and of ÖBB's (the code
-    series of `COVERAGE_OEBB_STOP_SERIES`, None to leave ÖBB's stops out)."""
+    series of `COVERAGE_OEBB_STOP_SERIES`, in their order: `oebb_stop_series`; none to leave
+    ÖBB's stops out)."""
 
-    def __init__(self, feeds: SessionFeeds, oebb_series: str | None) -> None:
+    def __init__(self, feeds: SessionFeeds, oebb_series: tuple[str, ...]) -> None:
         self._feeds = feeds
         self._oebb_series = oebb_series
 
     async def resolve(
         self, stops: Sequence[CanonicalStopPlace]
     ) -> Mapping[StopKey, ResolvedStation]:
-        """The stations of the stops the module places; a stop it does not is absent."""
+        """The stations of the stops the module places; a stop it does not is absent. Asked in
+        rounds: the answers kept are read first, then each round asks the keys still needed (a
+        feed's stops at once, ÖBB's numbers one series a round, only those the series before
+        placed nowhere), until every stop is settled or a call fails."""
         wanted = {
             (stop.source, stop.ref): keys_of(stop, self._feeds, self._oebb_series) for stop in stops
         }
-        answers: dict[ModuleKey, ResolvedStation | None] = {}
-        missing: list[ModuleKey] = []
+        answers: dict[ModuleKey, Answer] = {}
         for keys in wanted.values():
             for key in keys:
-                known, station = _cache.get(key)
-                if known:
-                    answers[key] = station
-                elif key not in answers:
-                    missing.append(key)
-        asked, reason = await self._ask_missing(missing, answers)
+                kept = _cache.get(key)
+                if kept is not None:
+                    answers[key] = kept
+        asked, reason = 0, "ok"
+        while reason == "ok":
+            missing = [key for keys in wanted.values() for key in _walk(keys, answers)[1]]
+            if not missing:
+                break
+            count, reason = await self._ask_missing(missing, answers)
+            asked += count
         placed: dict[StopKey, ResolvedStation] = {}
         for stop_key, keys in wanted.items():
-            for key in keys:
-                station = answers.get(key)
-                if station is not None:
-                    placed[stop_key] = station
-                    break
+            station, _ = _walk(keys, answers)
+            if station is not None:
+                placed[stop_key] = station
         log.info(
             "station_resolver.resolved stops=%d placed=%d asked=%d reason=%s",
             len(wanted),
@@ -292,9 +348,9 @@ class ModuleStationResolver:
         return placed
 
     async def _ask_missing(
-        self, missing: list[ModuleKey], answers: dict[ModuleKey, ResolvedStation | None]
+        self, missing: list[ModuleKey], answers: dict[ModuleKey, Answer]
     ) -> tuple[int, str]:
-        """Ask the keys not kept, call by call, keeping every answer; stop at the first call
+        """Ask the keys not known, call by call, keeping every answer; stop at the first call
         that fails (the module off, paused, at its ceiling, not answering). The number of keys
         asked, and `ok` or the failure's word."""
         asked = 0
@@ -310,7 +366,7 @@ class ModuleStationResolver:
             stations = _stations_of(outcome.rows)
             for value in values:
                 key = (kind, owner, value)
-                station = stations.get(value)
-                _cache.put(key, station)
-                answers[key] = station
+                answer = stations.get(value, Unplaced.NOWHERE)
+                _cache.put(key, answer)
+                answers[key] = answer
         return asked, "ok"

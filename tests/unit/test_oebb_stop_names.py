@@ -5,15 +5,16 @@ station for ÖBB's stop number.
 Bischofshofen), kept on the leg. The page asks POST
 /api/admin/network-coverage/oebb-stops/resolve which station of the module
 each number is linked to; the route asks the module one `POST
-/internal/v1/stops/resolve {"series", "code"}` per number not cached, in the
-series `COVERAGE_OEBB_STOP_SERIES`. Pinned here, the module never reached
-(`httpx.MockTransport`):
+/internal/v1/stops/resolve {"series", "code"}` per number and series not
+cached, in the series of `COVERAGE_OEBB_STOP_SERIES` in their order, the next
+only for a number the one before has no station for. Pinned here, the module
+never reached (`httpx.MockTransport`):
 
 - the client call: the body (never the URL), its own headers, the rows
   (how each matched), the values it refuses before any call, no pause after
   a failure;
-- the route: the setting's series, the cache, the first failure stopping the
-  rest (`unanswered`), the module off, the body refused;
+- the route: the setting's series and their order, the cache, the first
+  failure stopping the rest (`unanswered`), the module off, the body refused;
 - the page: the stop's number on its span, the request in the body, the name
   written as text, the legend; the setting on the Config page.
 
@@ -42,6 +43,7 @@ from app.settings import settings
 
 MODULE_URL = "http://msmm.invalid:8000"
 SERIES = "ZZ_stop_key"
+FALLBACK = "ZZ_other_key"
 REPO = Path(__file__).resolve().parents[2]
 PAGE = REPO / "app" / "templates" / "admin" / "network_coverage.html"
 CONFIG_PAGE = REPO / "app" / "templates" / "admin" / "config.html"
@@ -62,23 +64,32 @@ def _match(name: str = "Zzdorf Hbf", uic: str | None = "9900001", **extra: Any) 
 
 
 class Module:
-    """The module's stand-in: answers each resolve from `by_code` (no match
-    for a code it lacks) unless `handler` is set; records every request."""
+    """The module's stand-in: answers each resolve from `in_series` for its
+    (series, code), else from `by_code` (no match for a code it lacks), unless
+    `handler` is set; records every request."""
 
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
         self.by_code: dict[str, list[dict[str, Any]]] = {}
+        self.in_series: dict[tuple[str | None, str], list[dict[str, Any]]] = {}
         self.handler: Callable[[httpx.Request], httpx.Response] | None = None
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         if self.handler is not None:
             return self.handler(request)
-        code = json.loads(request.content)["code"]
-        return httpx.Response(200, json={"matches": self.by_code.get(code, [])})
+        body = json.loads(request.content)
+        key = (body["series"], body["code"])
+        matches = self.in_series[key] if key in self.in_series else self.by_code.get(key[1], [])
+        return httpx.Response(200, json={"matches": matches})
 
     def codes(self) -> list[str]:
         return [json.loads(r.content)["code"] for r in self.requests]
+
+    def asked(self) -> list[tuple[str | None, str]]:
+        return [
+            (json.loads(r.content)["series"], json.loads(r.content)["code"]) for r in self.requests
+        ]
 
 
 @pytest.fixture
@@ -213,10 +224,11 @@ async def test_the_route_answers_each_number_with_its_station_or_none(
     answer = await _resolve(["8199042", "999099"])
 
     assert answer.status == "ok"
-    assert answer.series == SERIES
+    assert answer.series == [SERIES]
     station = answer.stations["8199042"]
     assert station is not None
     assert (station.name, station.uic, station.others) == ("Zzdorf Hbf", "9900001", 1)
+    assert station.series == SERIES
     assert answer.stations["999099"] is None
     assert answer.unanswered == []
     assert module.codes() == ["8199042", "999099"]
@@ -300,26 +312,105 @@ async def test_with_the_module_off_nothing_is_asked(
 
 
 @pytest.mark.parametrize(
-    ("value", "expected"), [("", None), ("  ", None), (None, None), (" ZZ_key ", "ZZ_key")]
+    ("value", "expected"),
+    [("", None), ("  ", None), (" , ", None), (None, None), (" ZZ_key ", "ZZ_key")],
 )
 async def test_an_empty_setting_means_no_series(
     module: Module, series: Callable[[Any], None], value: Any, expected: str | None
 ) -> None:
     series(value)
     answer = await _resolve(["8199042"])
-    assert answer.series == expected
-    assert json.loads(module.requests[0].content)["series"] == expected
+    assert answer.series == ([] if expected is None else [expected])
+    assert module.asked() == [(expected, "8199042")]
 
 
+@pytest.mark.parametrize("value", ["x" * 101, f"{SERIES},{'x' * 101}"])
 async def test_a_series_the_module_refuses_is_said_and_nothing_asked(
-    module: Module, series: Callable[[Any], None]
+    module: Module, series: Callable[[Any], None], value: str
 ) -> None:
-    series("x" * 101)
+    series(value)
     answer = await _resolve(["8199042"])
     assert answer.status == "unavailable"
     assert answer.message is not None
     assert "COVERAGE_OEBB_STOP_SERIES" in answer.message
     assert module.requests == []
+
+
+# ── two series: the next only where the one before has no station ──
+
+
+async def test_a_number_is_asked_in_the_next_series_only_when_the_first_has_none(
+    module: Module, series: Callable[[Any], None]
+) -> None:
+    series(f"{SERIES}, {FALLBACK}")
+    module.in_series[(SERIES, "8199042")] = [_match("Zzdorf Hbf")]
+    module.in_series[(FALLBACK, "8799012")] = [_match("Zzville", "9900005")]
+    # Two stations in the first series: answered there (the best), never asked in the next.
+    module.in_series[(SERIES, "8399046")] = [_match("Zzano"), _match("Zzano Sud", "9900007")]
+
+    answer = await _resolve(["8199042", "8799012", "8399046", "999099"])
+
+    assert answer.status == "ok"
+    assert answer.series == [SERIES, FALLBACK]
+    assert {code: s and (s.name, s.series) for code, s in answer.stations.items()} == {
+        "8199042": ("Zzdorf Hbf", SERIES),
+        "8799012": ("Zzville", FALLBACK),
+        "8399046": ("Zzano", SERIES),
+        "999099": None,
+    }
+    assert module.asked() == [
+        (SERIES, "8199042"),
+        (SERIES, "8799012"),
+        (FALLBACK, "8799012"),
+        (SERIES, "8399046"),
+        (SERIES, "999099"),
+        (FALLBACK, "999099"),
+    ]
+
+
+async def test_the_cache_settles_each_series_and_asks_only_what_expired(
+    module: Module, series: Callable[[Any], None]
+) -> None:
+    series(f"{SERIES},{FALLBACK}")
+    module.in_series[(FALLBACK, "8799012")] = [_match("Zzville")]
+    await _resolve(["8799012", "999099"])
+    module.requests.clear()
+
+    again = await _resolve(["8799012", "999099"])
+
+    assert module.requests == []
+    assert again.stations["999099"] is None
+    assert again.stations["8799012"] is not None
+    del api._oebb_stop_cache[(FALLBACK, "8799012")]
+    await _resolve(["8799012"])
+    assert module.asked() == [(FALLBACK, "8799012")]
+
+
+async def test_a_failure_in_the_next_series_leaves_the_number_unanswered(
+    module: Module, series: Callable[[Any], None]
+) -> None:
+    series(f"{SERIES},{FALLBACK}")
+
+    def fallback_is_limited(request: httpx.Request) -> httpx.Response:
+        if json.loads(request.content)["series"] == FALLBACK:
+            return httpx.Response(
+                429, json={"detail": "ZZ", "code": "user_minute"}, headers={"Retry-After": "17"}
+            )
+        return httpx.Response(200, json={"matches": []})
+
+    module.handler = fallback_is_limited
+
+    answer = await _resolve(["8799012", "8799013"])
+
+    assert answer.status == "limited"
+    assert answer.stations == {}
+    assert answer.unanswered == ["8799012", "8799013"]
+    assert module.asked() == [(SERIES, "8799012"), (FALLBACK, "8799012")]
+    module.handler = None
+    module.requests.clear()
+    await _resolve(["8799012"])
+    # The first series' answer was kept: only the next one is asked again.
+    assert module.asked() == [(FALLBACK, "8799012")]
 
 
 @pytest.mark.parametrize(
@@ -362,10 +453,10 @@ def test_the_route_is_for_platform_admins_only(monkeypatch: pytest.MonkeyPatch) 
 # ───────────────────────────── the setting and the page ─────────────────────────────
 
 
-def test_the_setting_defaults_to_the_series_of_the_delfi_stop_keys() -> None:
+def test_the_setting_defaults_to_the_delfi_stop_keys_then_trainline_s_eva_numbers() -> None:
     assert CONFIG_SCHEMA["COVERAGE_OEBB_STOP_SERIES"] == {
         "type": "str",
-        "default": "DELFI_stop_key",
+        "default": "DELFI_stop_key,Trainline_EVA",
     }
     assert "'COVERAGE_OEBB_STOP_SERIES'" in CONFIG_PAGE.read_text(encoding="utf-8")
 
@@ -406,6 +497,17 @@ def test_the_page_asks_in_the_body_and_names_stops_as_text(page: str) -> None:
     apply = _function(page, "applyOebbStopStation")
     assert "span.textContent = station.name;" in apply
     assert "innerHTML" not in apply  # a station name is a third party's text
+
+
+def test_the_page_names_the_series_a_stop_was_found_in_and_every_series_asked(page: str) -> None:
+    resolve = _function(page, "resolveModalOebbStops")
+    assert "OEBB_STOP_SERIES = Array.isArray(answer.series) ? answer.series : [];" in resolve
+    assert "if (station.series) parts.push('series ' + station.series);" in _function(
+        page, "oebbStopTitle"
+    )
+    assert "' in series ' + OEBB_STOP_SERIES.join(' or ')" in _function(
+        page, "applyOebbStopStation"
+    )
 
 
 def test_the_modal_names_its_stops_once_rendered_and_after_a_live_verify(page: str) -> None:

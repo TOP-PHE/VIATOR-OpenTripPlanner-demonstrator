@@ -460,12 +460,12 @@ def _station_resolvers(
     db: DbSession, sessions: list[SessionRow], cfg: dict[str, Any]
 ) -> tuple[dict[str, StationResolver], StationResolver]:
     """(DB step) The station resolver of each fanout session (its feeds and uploads) and the
-    one of ÖBB's numbers (`COVERAGE_OEBB_STOP_SERIES`, the series the coverage check uses)."""
+    one of ÖBB's numbers (`COVERAGE_OEBB_STOP_SERIES`, the series the coverage check uses, in
+    their order)."""
     # The upload sender's module imports the extractor, which needs `fcntl`: imported here.
     from ..station_extract_upload import latest_upload_sha256
 
-    series_value = cfg.get("COVERAGE_OEBB_STOP_SERIES")
-    series = str(series_value) if series_value else None
+    series = station_resolver.oebb_stop_series(cfg.get("COVERAGE_OEBB_STOP_SERIES"))
     resolvers: dict[str, StationResolver] = {}
     for session in sessions:
         sid = session.id

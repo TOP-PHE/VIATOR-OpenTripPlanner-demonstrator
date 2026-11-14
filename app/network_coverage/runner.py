@@ -2034,22 +2034,23 @@ def _persist_alignment_on_row(
 class _SweepStations:
     """The stations of a check's journeys (#304, design D8): a station resolver per VIATOR
     session (`station_resolver.resolver_for_session`, built once, from the session's providers
-    and uploads) and ÖBB's numbers in `COVERAGE_OEBB_STOP_SERIES`. A journey is resolved by the
-    resolver of its own session (a fanout run mixes them), else the run's. Off when the station
-    module is not configured. Never fails a cell: a failure leaves the stops unplaced, and the
+    and uploads) and ÖBB's numbers in the series of `COVERAGE_OEBB_STOP_SERIES`, in their order.
+    A journey is resolved by the resolver of its own session (a fanout run mixes them), else the
+    run's. Off when the station module is not configured. Never fails a cell: a failure leaves the stops unplaced, and the
     matching then falls back to codes and positions."""
 
     def __init__(self, db: DbSession, run: NetworkCoverageRun) -> None:
         from .. import station_module
+        from ..journey.station_resolver import oebb_stop_series
 
         self._db = db
         self._run_session = run.session_id
         self._enabled = station_module.enabled()
-        self._series: str | None = None
+        self._series: tuple[str, ...] = ()
         self._resolvers: dict[str | None, Any] = {}
         if self._enabled:
             series = config_service.get_all(db).get("COVERAGE_OEBB_STOP_SERIES")
-            self._series = str(series) if series else None
+            self._series = oebb_stop_series(series)
 
     def _resolver(self, session_id: str | None) -> Any:
         from ..journey.station_resolver import (

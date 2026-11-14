@@ -4847,24 +4847,45 @@ VIATOR's engine names in the left column, the modal asks the module which
 station each number is linked to and shows that station's name:
 
 - `POST /api/admin/network-coverage/oebb-stops/resolve` with `{"codes": [...]}`
-  (at most 40 numbers, in the body), then one call of the module per number not
-  answered in the last 6 hours: `POST /internal/v1/stops/resolve {"series",
-  "code"}`. Each number is **one call on your module limits**; the stations seen
-  on most cells (Wien, München, Frankfurt) are answered from VIATOR's cache.
-  The first refusal (the limit, the module unreachable) stops the rest: those
-  stops keep ÖBB's own name.
-- The series is the setting **`COVERAGE_OEBB_STOP_SERIES`** (Admin →
-  Configuration → Network coverage matrix), `DELFI_stop_key` by default. The
-  module files ÖBB's stop numbers there: they are EVA numbers, which the
-  German DELFI feed uses as its stop keys, and the module's links tie them to
-  ÖBB's stations through ÖBB's GeoNetz. ÖBB's own NAP feed does not carry
-  them: it files its stops under their NeTEx ids (series `OeBB_NAP_stop_key`,
-  `at:45:52099`), which ÖBB HAFAS never returns. Change the setting if the
-  module ever files the EVA numbers under another series (empty = no series).
+  (at most 40 numbers, in the body), then one call of the module per number and
+  series not answered in the last 6 hours: `POST /internal/v1/stops/resolve
+  {"series", "code"}`. Each call is **one call on your module limits**: a
+  number found in the first series costs one, a number outside Germany and
+  Austria one a series (two with the default), so a first look at a cell far
+  from Austria can reach your 60 a minute; the stations seen on most cells
+  (Wien, München, Frankfurt) are answered from VIATOR's cache. The first
+  refusal (the limit, the module unreachable) stops the rest: those stops keep
+  ÖBB's own name, and the next look asks only what is left.
+- The series are the setting **`COVERAGE_OEBB_STOP_SERIES`** (Admin →
+  Configuration → Network coverage matrix): names separated by commas, asked
+  in that order, `DELFI_stop_key,Trainline_EVA` by default (since 14 Nov
+  2026; one name alone is one series, as before). A number is asked in the
+  next series **only when the one before has no station for it** (the
+  module's decision 72): a number of several stations in a series is answered
+  there. The module files ÖBB's stop numbers in both: they are EVA numbers;
+  in `DELFI_stop_key` for Germany and Austria, which the German DELFI feed
+  uses as its stop keys and the module's links tie to ÖBB's stations through
+  ÖBB's GeoNetz; in `Trainline_EVA` for the other countries, Trainline's
+  `db_id`/`obb_id` of the station (the module's design 22.19, MSMM #86).
+  Whether a given number is there (ÖBB's 8700012 for Paris Gare de Lyon,
+  8300046 for Milano Centrale, measured on ÖBB on 12 Nov) is known only once
+  the module's master is rebuilt with it: MSMM #86 measured nothing yet, so
+  look one up before reading a ⚠ as a gap. ÖBB's own NAP feed does not
+  carry them: it files its stops under their NeTEx ids (series
+  `OeBB_NAP_stop_key`, `at:45:52099`), which ÖBB HAFAS never returns. Change
+  the setting if the module ever files the EVA numbers under another series
+  (empty = no series). A module without `Trainline_EVA` (before MSMM #86 is
+  deployed) answers that series with no station: the modal then shows ⚠ as
+  before, nothing fails.
+- The coverage check's scoring and `/journey`'s comparison place ÖBB's stops
+  by the same series in the same order (the module's call for many stops,
+  `station_resolver`: the first series for every number, the next one only
+  for the numbers left without a station).
 - What the modal shows: the module's station name (underlined dotted), and on
-  hover ÖBB's number and name, the module's station, its MERITS code and how
-  it matched (`code`, or a link with its tier). **⚠** after ÖBB's own name =
-  no station of the module carries that number in that series. A module
+  hover ÖBB's number and name, the module's station, its MERITS code, how it
+  matched (`code`, or a link with its tier) and the series it was found in.
+  **⚠** after ÖBB's own name = no station of the module carries that number in
+  any of the series (the hover names them). A module
   station whose MERITS code differs from the hub's or from VIATOR's is a
   mapping to look at (Graz Hbf: the module's MERITS code is 8103171, while
   ÖBB HAFAS gives `U×8103172` for its station).

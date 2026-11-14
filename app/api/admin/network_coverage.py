@@ -79,6 +79,7 @@ from ...config_schema import CONFIG_SCHEMA
 from ...db import get_db
 from ...db_steps import db_step
 from ...journey.canonical import CanonicalJourney
+from ...journey.station_resolver import oebb_stop_series
 from ...models import (
     JourneySearchExecution,
     JourneyTrip,
@@ -3481,12 +3482,15 @@ def _verify_inputs(
 # `extId`, kept on the leg as `from_id_raw` / `to_id_raw`, or the number of
 # the `UIC:` / `OEBB:` token of an older row). To check the station mapping
 # against VIATOR's own legs, the page asks which station of the station module
-# each number is linked to: one resolve call of the module per number not
-# known yet, in the series `COVERAGE_OEBB_STOP_SERIES` (where the module files
-# these numbers: see that key in app/config_schema.py). An answer is kept per
+# each number is linked to: one resolve call of the module per number and
+# series not known yet, in the series of `COVERAGE_OEBB_STOP_SERIES` in their
+# order (where the module files these numbers: see that key in
+# app/config_schema.py), the next series only when the one before has no
+# station for the number (the module's decision 72). An answer is kept per
 # (series, number) for OEBB_STOP_CACHE_SECONDS, so the stations seen on every
 # cell (Wien, München, Frankfurt) cost one call a few times a day, not one per
-# modal. Every number is one call on the administrator's module limits.
+# modal. Every call is on the administrator's module limits: a number outside
+# Germany and Austria costs one call a series.
 
 OEBB_STOPS_MAX = 40
 OEBB_STOP_CACHE_SECONDS = 6 * 3600.0
@@ -3500,6 +3504,8 @@ _OEBB_SERIES_REFUSED = (
     "The setting COVERAGE_OEBB_STOP_SERIES holds a series the station module does not "
     "take; correct it under Admin, Configuration."
 )
+# The series asked for an empty setting: one resolve call in no series (`"series": null`).
+_NO_SERIES: tuple[str | None, ...] = (None,)
 
 
 class OebbStopsRequest(BaseModel):
@@ -3521,7 +3527,8 @@ class OebbStopStation(BaseModel):
     """The station of the module an ÖBB stop number is linked to: its name,
     MERITS code (None for a station without one) and country; how it matched
     and, for a link, whether it is asserted and its tier; `others`, how many
-    more stations carry the same number (at most 9: the module answers ten)."""
+    more stations carry the same number (at most 9: the module answers ten);
+    `series`, the series the number was found in (None: asked in no series)."""
 
     name: str
     uic: str | None = None
@@ -3530,18 +3537,20 @@ class OebbStopStation(BaseModel):
     asserted: bool | None = None
     tier: str | None = None
     others: int = 0
+    series: str | None = None
 
 
 class OebbStopsResponse(BaseModel):
     """`stations`: each number answered, with its station, or None when no
-    station of the module carries it. `unanswered`: the numbers not asked,
-    because the module stopped answering (`status` and `message` say why) or
-    is not configured."""
+    station of the module carries it in any series asked. `unanswered`: the
+    numbers not settled, because the module stopped answering (`status` and
+    `message` say why) or is not configured. `series`: the series asked, in
+    their order (empty: in no series)."""
 
     status: Literal["ok", "limited", "unavailable"]
     message: str | None = None
     retry_after: int | None = None
-    series: str | None = None
+    series: list[str] = Field(default_factory=list)
     stations: dict[str, OebbStopStation | None]
     unanswered: list[str]
 
@@ -3549,28 +3558,25 @@ class OebbStopsResponse(BaseModel):
 _oebb_stop_cache: dict[tuple[str | None, str], tuple[float, OebbStopStation | None]] = {}
 
 
-def _oebb_stop_series(db: DbSession) -> str | None:
-    """The series the module files ÖBB's stop numbers under; None (no series)
-    when the setting is empty."""
-    value = config_service.get_all(db).get("COVERAGE_OEBB_STOP_SERIES")
-    if not isinstance(value, str):
-        return None
-    return value.strip() or None
+def _oebb_stop_series(db: DbSession) -> tuple[str, ...]:
+    """The series the module files ÖBB's stop numbers under, in the order
+    they are asked; none when the setting is empty."""
+    return oebb_stop_series(config_service.get_all(db).get("COVERAGE_OEBB_STOP_SERIES"))
 
 
-def _cached_oebb_stops(
-    series: str | None, codes: list[str], now: float
-) -> tuple[dict[str, OebbStopStation | None], list[str]]:
-    """The numbers' stations still in the cache, and the numbers to ask."""
-    known: dict[str, OebbStopStation | None] = {}
-    todo: list[str] = []
-    for code in codes:
-        cached = _oebb_stop_cache.get((series, code))
-        if cached is not None and cached[0] > now:
-            known[code] = cached[1]
-        else:
-            todo.append(code)
-    return known, todo
+def _cached_oebb_stop(
+    series: tuple[str | None, ...], code: str, now: float
+) -> tuple[OebbStopStation | None, tuple[str | None, ...]]:
+    """The number's station as the cache settles it, and the series still to
+    ask for it, in order (none when the cache settles it): a series kept as
+    carrying no station gives way to the next one."""
+    for index, one in enumerate(series):
+        cached = _oebb_stop_cache.get((one, code))
+        if cached is None or cached[0] <= now:
+            return None, series[index:]
+        if cached[1] is not None:
+            return cached[1], ()
+    return None, ()
 
 
 def _remember_oebb_stop(
@@ -3589,12 +3595,29 @@ def _remember_oebb_stop(
             asserted=best["asserted"],
             tier=best["tier"],
             others=len(rows) - 1,
+            series=series,
         )
     _oebb_stop_cache.pop((series, code), None)
     _oebb_stop_cache[(series, code)] = (now + OEBB_STOP_CACHE_SECONDS, station)
     while len(_oebb_stop_cache) > OEBB_STOP_CACHE_MAX:
         _oebb_stop_cache.pop(next(iter(_oebb_stop_cache)))
     return station
+
+
+async def _ask_oebb_stop(
+    code: str, series: tuple[str | None, ...], user_id: uuid.UUID
+) -> tuple[OebbStopStation | None, station_module.Outcome | None]:
+    """Ask the module for `code` in each of `series` in order, until one has a
+    station for it (each answer kept): the station or None, and the outcome of
+    a call that failed (None when none did)."""
+    for one in series:
+        outcome = await station_module.resolve_code_outcome(one, code, user_id)
+        if outcome.rows is None:
+            return None, outcome
+        station = _remember_oebb_stop(one, code, outcome.rows, time.monotonic())
+        if station is not None:
+            return station, None
+    return None, None
 
 
 @router.post("/oebb-stops/resolve", responses=_HUB_CODE_RESPONSES)
@@ -3605,41 +3628,57 @@ async def resolve_oebb_stops(
 ) -> OebbStopsResponse:
     """The station of the module each ÖBB HAFAS stop number is linked to, for
     the cell modal: the numbers in the body's JSON (never in the URL), one
-    module call per number not in the cache, one after the other, on behalf
-    of the administrator. Stops at the first failure (a 429 of the person's
-    limit, the module unreachable) and answers what it has, the rest
-    `unanswered`, never retrying. Writes nothing."""
+    module call per number and series not in the cache, one after the other,
+    on behalf of the administrator; a number is asked in the next series of
+    the setting only when the one before has no station for it. Stops at the
+    first failure (a 429 of the person's limit, the module unreachable) and
+    answers what it has, the rest `unanswered`, never retrying. Writes
+    nothing."""
     asked = _body_or_422(OebbStopsRequest, body, _OEBB_STOPS_REFUSED)
     user_id = _caller(admin)
-    series = await db_step(_oebb_stop_series, db)
-    if series is not None and station_module.resolve_text_refused(series) is not None:
+    setting = await db_step(_oebb_stop_series, db)
+    named = list(setting)
+    if any(station_module.resolve_text_refused(one) is not None for one in setting):
         return OebbStopsResponse(
             status="unavailable",
             message=_OEBB_SERIES_REFUSED,
-            series=series,
+            series=named,
             stations={},
             unanswered=asked.codes,
         )
-    stations, todo = _cached_oebb_stops(series, asked.codes, time.monotonic())
+    series = setting or _NO_SERIES
+    now = time.monotonic()
+    stations: dict[str, OebbStopStation | None] = {}
+    todo: list[tuple[str, tuple[str | None, ...]]] = []
+    for code in asked.codes:
+        station, left = _cached_oebb_stop(series, code, now)
+        if left:
+            todo.append((code, left))
+        else:
+            stations[code] = station
     refusal = _module_refusal() if todo else None
     if refusal is not None:
         return OebbStopsResponse(
-            status="unavailable", message=refusal, series=series, stations=stations, unanswered=todo
+            status="unavailable",
+            message=refusal,
+            series=named,
+            stations=stations,
+            unanswered=[number for number, _ in todo],
         )
-    for index, code in enumerate(todo):
-        outcome = await station_module.resolve_code_outcome(series, code, user_id)
-        if outcome.rows is None:
-            status, message, retry_after = _failure(outcome)
+    for index, (code, left) in enumerate(todo):
+        station, failed = await _ask_oebb_stop(code, left, user_id)
+        if failed is not None:
+            status, message, retry_after = _failure(failed)
             return OebbStopsResponse(
                 status=status,
                 message=message,
                 retry_after=retry_after,
-                series=series,
+                series=named,
                 stations=stations,
-                unanswered=todo[index:],
+                unanswered=[number for number, _ in todo[index:]],
             )
-        stations[code] = _remember_oebb_stop(series, code, outcome.rows, time.monotonic())
-    return OebbStopsResponse(status="ok", series=series, stations=stations, unanswered=[])
+        stations[code] = station
+    return OebbStopsResponse(status="ok", series=named, stations=stations, unanswered=[])
 
 
 # ─────────────────────────── helpers ───────────────────────────
