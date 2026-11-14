@@ -227,5 +227,5 @@ def test_a_session_unknown_to_the_database_gets_a_resolver_for_oebb_s_stops_only
     resolver = stations._resolver("gone")
 
     assert resolver._feeds.motis == {}
-    assert resolver._oebb_series == "zz"
+    assert resolver._oebb_series == ("zz",)
     assert stations._resolver("gone") is resolver  # built once

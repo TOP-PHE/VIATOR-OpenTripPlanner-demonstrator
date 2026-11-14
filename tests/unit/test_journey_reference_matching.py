@@ -257,11 +257,11 @@ def test_each_session_s_resolver_is_built_from_its_feeds(monkeypatch: pytest.Mon
     resolvers, oebb = api._station_resolvers(
         MagicMock(),
         sessions,
-        {"COVERAGE_OEBB_STOP_SERIES": "DELFI_stop_key"},  # type: ignore[arg-type]
+        {"COVERAGE_OEBB_STOP_SERIES": "DELFI_stop_key, Trainline_EVA"},  # type: ignore[arg-type]
     )
 
     assert resolvers == {"s1": "resolver of one", "s2": "resolver of None"}
-    assert built[0] == ({"name": "one"}, {"p": "sha of s1"}, "DELFI_stop_key")
+    assert built[0] == ({"name": "one"}, {"p": "sha of s1"}, ("DELFI_stop_key", "Trainline_EVA"))
     assert built[1][0] == {}
     assert isinstance(oebb, api.station_resolver.ModuleStationResolver)
 

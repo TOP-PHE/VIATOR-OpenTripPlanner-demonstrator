@@ -155,15 +155,20 @@ CONFIG_SCHEMA: dict[str, FieldSpec] = {
     "COVERAGE_VERIFY_MAX_PAGES": {"type": "int", "default": 3, "min": 1, "max": 10},
     # The code series of the station module under which ÖBB HAFAS's own stop
     # numbers (its `extId`, an EVA number such as 8100042 for Bischofshofen)
-    # are filed. The cell modal asks the module, by `POST /stops/resolve
-    # {series, code}`, which station each ÖBB stop number is linked to, and
-    # shows that station's name. ÖBB's own NAP feed files its stops under
-    # their NeTEx ids (series `OeBB_NAP_stop_key`, `at:45:52099`), which HAFAS
-    # does not return; the EVA numbers reach the module as the stop keys of the
-    # German DELFI feed (`DELFI_stop_key`), with ÖBB's GeoNetz as the link's
-    # evidence. A series is the module's data (its links file), never guessed:
-    # change it here when the module files them under another one.
-    "COVERAGE_OEBB_STOP_SERIES": {"type": "str", "default": "DELFI_stop_key"},
+    # are filed, separated by commas, in the order they are asked: a number is
+    # asked in the next series only when the one before has no station for it
+    # (the module's decision 72). The cell modal asks the module, by `POST
+    # /stops/resolve {series, code}`, which station each ÖBB stop number is
+    # linked to, and shows that station's name; the matching asks the
+    # stations of many numbers at once. ÖBB's own NAP feed files its stops
+    # under their NeTEx ids (series `OeBB_NAP_stop_key`, `at:45:52099`), which
+    # HAFAS does not return; the EVA numbers of Germany and Austria reach the
+    # module as the stop keys of the German DELFI feed (`DELFI_stop_key`),
+    # with ÖBB's GeoNetz as the link's evidence; the others as Trainline's
+    # `db_id`/`obb_id` (`Trainline_EVA`, the module's design 22.19, MSMM #86).
+    # A series is the module's data (its links file, its master), never
+    # guessed: change it here when the module files them under another one.
+    "COVERAGE_OEBB_STOP_SERIES": {"type": "str", "default": "DELFI_stop_key,Trainline_EVA"},
     # ── Coverage matching (#304, docs/journey-matching-engine-design.md §10) ──
     # How the ÖBB check pairs a cell's VIATOR journeys with ÖBB's: the profile
     # `coverage_alignment` of `app/journey/matching/profiles.py` with these laid
