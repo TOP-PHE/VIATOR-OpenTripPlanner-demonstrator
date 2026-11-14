@@ -619,8 +619,10 @@ def oebb_payload(*connections: list[dict[str, Any]]) -> dict[str, Any]:
 
     - `mode`: RAIL, BUS, TRAM, SUBWAY or FERRY (a ride, its category `RJ`, `Bus`…), or WALK;
       `cat` overrides the category;
-    - `from_uic` / `to_uic`: the stop token ÖBB's id gives (`UIC:8503000` → `extId` 8503000,
-      `OEBB:904050` → `extId` 904050, None → no id at all);
+    - `from_uic` / `to_uic`: the stop token ÖBB's id gives (`UIC:8503000` → `extId` 8503000 that
+      ÖBB also states as the stop's UIC, `gidL` `U\u00d78503000`, as for Zürich HB; `OEBB:904050` →
+      `extId` 904050; `EVA:8700012` → `extId` 8700012 with no UIC stated, as for Paris Gare de
+      Lyon; None → no id at all);
     - `dep` / `arr`: Europe/Vienna wall clock `YYYY-MM-DDTHH:MM` (ÖBB's form), None → no time;
     - `route`: the label HAFAS shows (`RJ 1141`), `line` its line.
     """
@@ -638,6 +640,8 @@ def oebb_payload(*connections: list[dict[str, Any]]) -> dict[str, Any]:
             }
             if ext_id:
                 entry["extId"] = ext_id
+            if token and token.startswith("UIC:"):
+                entry["gidL"] = [f"U\u00d7{ext_id}"]
             location_index[token] = len(locations)
             locations.append(entry)
         return location_index[token]

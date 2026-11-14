@@ -226,7 +226,9 @@ def test_guard_rejects_cross_namespace_endpoints() -> None:
 def test_guard_accepts_when_both_sides_reduce_to_the_same_uic() -> None:
     """The one case the fix is allowed to NEWLY accept — without it the fix is
     unfalsifiable. The ÖBB side is built through the real adapter from a
-    zero-padded extId, so this exercises the whole path, not just the scorer."""
+    zero-padded extId, so this exercises the whole path, not just the scorer.
+    Both stops are ones whose number ÖBB states as their UIC (`gidL` `U\u00d7…`, measured
+    2026-11-12): only those reach the UIC namespace (`test_oebb_stop_numbers.py`)."""
     section = {
         "type": "JNY",
         "dep": {"locX": 0, "dTimeS": "080000"},
@@ -239,17 +241,25 @@ def test_guard_accepts_when_both_sides_reduce_to_the_same_uic() -> None:
         [connection],
         {
             "locL": [
-                {"lid": "A=1@O=Wien Hbf@X=16375526@L=008103000@", "extId": "008103000"},
-                {"lid": "A=1@O=Zuerich HB@X=8540192@L=8503000@", "extId": "8503000"},
+                {
+                    "lid": "A=1@O=Basel SBB@X=7589563@L=008500010@",
+                    "extId": "008500010",
+                    "gidL": ["U\u00d78500010"],
+                },
+                {
+                    "lid": "A=1@O=Zuerich HB@X=8540192@L=8503000@",
+                    "extId": "8503000",
+                    "gidL": ["U\u00d78503000"],
+                },
             ],
             "prodL": [{"name": "RJ 1141", "prodCtx": {"catOut": "RJ"}}],
         },
     )
     (o_journey,) = hafas_adapter.journeys_from_trip_search(payload)
     (o_leg,) = oebb_journeys.scoring_legs(o_journey)
-    assert o_leg["from_stop_id"] == "UIC:8103000", "zero padding absorbed"
+    assert o_leg["from_stop_id"] == "UIC:8500010", "zero padding absorbed"
 
-    v = [_viator_trip([_v_leg(from_uic="8103000", to_uic="8503000")])]
+    v = [_viator_trip([_v_leg(from_uic="8500010", to_uic="8503000")])]
     _score, tier = _scored(v, [o_journey])
 
     assert tier == "agree"

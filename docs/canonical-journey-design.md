@@ -240,7 +240,7 @@ journey. OJP 2.0 / Transmodel names are given where the concept exists.
 | `ref` | `str` | Source-scoped id as the source gave it (`nl-nap_2992170`, `SBB:8507000:0:7`, `ch:1:sloid:7000:4:7`, ÖBB `extId`). Provenance only. |
 | `source` | `str` | Namespace of `ref` (`motis:nl-nap`, `otp:SBB`, `hafas:oebb`, `ojp:ch`). |
 | `name` | `str \| None` | |
-| `uic` | `str \| None` | 7 digits, set **only** by today's rules: `_fingerprint_stop_token` steps 0, 0b, 1 for VIATOR ids; `oebb_stop_id` (`extId`, then lid `L=`) for HAFAS. A VIATOR id of the station module (`ZZ-99999`) is never put here. |
+| `uic` | `str \| None` | 7 digits, set **only** by today's rules: `_fingerprint_stop_token` steps 0, 0b, 1 for VIATOR ids; for HAFAS, `oebb_stop_id`'s number (`extId`, then lid `L=`) **only where ÖBB's `gidL` states that same number as the UIC** (`U`+`×`+digits; since 2026-11-12: ÖBB's number is its EVA number, which differs from the UIC in France, Italy, Austria…, `hafas_adapter` docstring). A VIATOR id of the station module (`ZZ-99999`) is never put here. |
 | `codes` | `dict[str, str]` | Codes by series, e.g. `{"UIC": "8100173", "OEBB_EXT": "8100173", "GTFS_STOP_CODE": "1101", "SLOID": "ch:1:sloid:7000"}`. Keeps the evidence a later resolution (station module, D8) needs. |
 | `parent_ref` | `str \| None` | MOTIS `parentId`, OJP parent StopPlace, OTP parent station. |
 | `unresolved_token` | `str \| None` | `OEBB:<payload>` when ÖBB names a station outside the UIC namespace (Wien Hbf's bus terminal `904050`). Kept so it can never re-parse as a UIC (trip-wire `test_oebb_token_can_never_reparse_as_a_uic`). |
@@ -433,7 +433,7 @@ what hid the `extract_uic` bug).
 | `train_number` | digits of `prod.name` when it parses as `<category> <digits>` |
 | `journey_ref`, `destination_text` | `jny.jid`, `dirTxt` |
 | operator | `opL[oprX].{name, id}` |
-| stop place | `locL[locX]`: `extId` → `codes.OEBB_EXT`, `uic` / `unresolved_token` by `oebb_stop_id` (never `extract_uic` on a lid), `name`, `crd` → position |
+| stop place | `locL[locX]`: `extId` (else the lid's `L=`) → `codes.OEBB_EXT`; `uic` by `oebb_stop_id` (never `extract_uic` on a lid) only when `gidL` states the same number as the UIC, `unresolved_token` for a number outside the UIC form (`OEBB:904050`); `name`, `crd` → position |
 
 The coverage sweep keeps calling `external_verify.fetch_oebb_two_step` (transport); the adapter
 turns its answer into canonical journeys, which PR 4 stores in `external_journeys` (§5.5).

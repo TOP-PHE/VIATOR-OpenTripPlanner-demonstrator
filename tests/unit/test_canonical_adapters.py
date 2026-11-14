@@ -110,11 +110,15 @@ def test_hafas_vienna_local_times_become_utc_once() -> None:
     assert night.arrival.timetabled == datetime(2026, 11, 4, 1, 0, tzinfo=UTC)
 
 
-def test_hafas_station_identity_from_ext_id_never_from_the_lid_coordinates() -> None:
+def test_hafas_stop_number_from_ext_id_never_from_the_lid_coordinates() -> None:
+    """The number is ÖBB's `extId`, never a coordinate of the lid. It is not a UIC: these stops'
+    `gidL` state none (Graz Hbf's EVA 8100173; its MERITS code is 8103171), so they are placed by
+    the station module or by position (`test_oebb_stop_numbers.py`)."""
     rj, s7, night = _hafas()
-    assert rj.legs[0].origin.stop_place.uic == "8103000"
+    wien = rj.legs[0].origin.stop_place
+    assert (wien.uic, wien.codes) == (None, {"OEBB_EXT": "8103000"})
     graz = s7.legs[1].origin.stop_place
-    assert (graz.uic, graz.codes) == ("8100173", {"OEBB_EXT": "8100173"})
+    assert (graz.uic, graz.codes) == (None, {"OEBB_EXT": "8100173"})
     terminal = night.legs[0].origin.stop_place
     assert terminal.uic is None
     assert terminal.unresolved_token == "OEBB:904050"

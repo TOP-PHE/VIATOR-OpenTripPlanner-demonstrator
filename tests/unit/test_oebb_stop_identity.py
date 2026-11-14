@@ -123,16 +123,18 @@ def test_leg_endpoints_are_station_ids_not_longitudes() -> None:
     assert scored["from_stop_id"] == "UIC:8400058", "Amsterdam Centraal, from extId"
     assert scored["to_stop_id"] == "UIC:8800004", "Bruxelles Midi, from extId"
     # Provenance survives to the stored journey, which the modal reads (#303 PR 4b): ÖBB's
-    # extId for the station module, the UIC the token gave, ÖBB's own name.
+    # extId for the station module and ÖBB's own name. The probe's `locL` states no UIC (no
+    # `gidL`), so ÖBB's number is not taken as one: no `uic` (the adapter's rule since #456).
     origin = journey.legs[0].origin
     stop = origin.stop_place
     assert stop is not None
     assert stop.codes == {"OEBB_EXT": "8400058"}
-    assert stop.uic == "8400058"
+    assert stop.uic is None
     assert origin.name == "Amsterdam Centraal"
     destination = journey.legs[0].destination.stop_place
     assert destination is not None
-    assert destination.uic == "8800004"
+    assert destination.codes == {"OEBB_EXT": "8800004"}
+    assert destination.uic is None
 
 
 @pytest.mark.parametrize(
