@@ -110,7 +110,7 @@ _OEBB_UIC_RE = re.compile(r"\A0*([1-9]\d{6,7})\Z")
 # 2019.
 
 # Public: the stop list of ÖBB's places is keyed by this address (the station module's
-# `hafas:` key, `station_module.hafas_identity`; `app/hafas_stop_list.py`).
+# `hafas:` key, made by the module client's `hafas_identity`; `app/hafas_stop_list.py`).
 OEBB_ENDPOINT = "https://fahrplan.oebb.at/bin/mgate.exe"
 _OEBB_AID = "OWDL4fE4ixNiPBBm"
 # Source label propagated on every VerifyResult. Single constant so the
