@@ -109,7 +109,9 @@ _OEBB_UIC_RE = re.compile(r"\A0*([1-9]\d{6,7})\Z")
 # client install on the planet. ÖBB hasn't rotated them since at least
 # 2019.
 
-_OEBB_ENDPOINT = "https://fahrplan.oebb.at/bin/mgate.exe"
+# Public: the stop list of ÖBB's places is keyed by this address (the station module's
+# `hafas:` key, `station_module.hafas_identity`; `app/hafas_stop_list.py`).
+OEBB_ENDPOINT = "https://fahrplan.oebb.at/bin/mgate.exe"
 _OEBB_AID = "OWDL4fE4ixNiPBBm"
 # Source label propagated on every VerifyResult. Single constant so the
 # UI verdict-colour logic can equality-check it (and Sonar S1192 is happy
@@ -574,7 +576,7 @@ async def _post_hafas(
     coverage check gets what is left of its cell's budget)."""
     extra: dict[str, Any] = {} if timeout_s is None else {"timeout": timeout_s}
     try:
-        response = await client.post(_OEBB_ENDPOINT, json=body, headers=_HEADERS, **extra)
+        response = await client.post(OEBB_ENDPOINT, json=body, headers=_HEADERS, **extra)
     except httpx.HTTPError as e:
         # Timeouts stringify to "" — name the type, or the UI shows "http: ".
         detail = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__

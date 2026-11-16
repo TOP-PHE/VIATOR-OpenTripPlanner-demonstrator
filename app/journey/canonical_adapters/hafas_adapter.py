@@ -15,6 +15,8 @@ station"), and coverage cells touching France scored 1 % agreement (run f7165bd7
 that differs from the number is not used either: it can be off by a digit (Graz Hbf `U\u00d78103172`,
 MERITS 8103171), and a wrong UIC vetoes again. Such a stop keeps its number in `codes` (the station
 module's key) and is compared by the station module, else by position on a time-matched leg (M4).
+The stated `U\u00d7` itself, equal or not, is kept in `codes` too (`HAFAS_UIC`): the HAFAS stop list
+sends it to the station module as evidence for its matching (`app/hafas_stop_list.py`).
 
 `prodL` gives the label HAFAS shows (`name`: `RJ 1141`, `S 7`), a line (`addName` / `nameS`),
 the category (`prodCtx.catOut`) and the train number (`prodCtx.num`) when HAFAS sends it.
@@ -53,6 +55,9 @@ from ._common import (
 )
 
 STOP_SOURCE = "hafas:oebb"
+# The code of a stop that holds the UIC ÖBB states in its `gidL` (`U\u00d7`), equal to its number
+# or not: what the HAFAS stop list sends the station module as `uic=` (`app/hafas_stop_list.py`).
+STATED_UIC_CODE = "HAFAS_UIC"
 # HAFAS gives ÖBB times as Europe/Vienna wall clock.
 REFERENCE_TZ = "Europe/Vienna"
 # A `gidL` entry stating the stop's UIC code: `U\u00d78503000` (U, MULTIPLICATION SIGN, the digits; an
@@ -187,15 +192,22 @@ def _stop_place(loc: Mapping[str, Any]) -> CanonicalStopPlace | None:
     # unconfirmed 7-digit number gets no `OEBB:` token either: a payload of 7 or 8 digits would break
     # `_oebb_opaque_payload`'s invariant. The stop keeps it in `codes` and is placed by the station
     # module or by its position.
-    uic = number if number is not None and number == loc.get("stated_uic") else None
+    stated = loc.get("stated_uic")
+    uic = number if number is not None and number == stated else None
     own_number = str(ext_id) if ext_id is not None else identity.raw
+    codes = {"OEBB_EXT": own_number} if own_number else {}
+    if stated:
+        # Whatever UIC `gidL` states is kept as evidence for the station module's matching of
+        # the HAFAS stop list (its design 22.20, `uic=` of the list's codes), never as the stop's
+        # `uic`: one that differs from the number is not trusted to compare stations (above).
+        codes[STATED_UIC_CODE] = stated
     return CanonicalStopPlace(
         ref=str(lid),
         source=STOP_SOURCE,
         name=text_or_none(loc.get("name")),
         uic=uic,
         unresolved_token=token if token.startswith("OEBB:") else None,
-        codes={"OEBB_EXT": own_number} if own_number else {},
+        codes=codes,
         position=position(loc.get("lat"), loc.get("lon")),
     )
 

@@ -355,6 +355,15 @@ def main() -> None:
     # #392 — coverage runs execute here, beside the build loop.
     _start_coverage_executor()
 
+    # The station module's 22.20 — the places ÖBB's planner answered in the coverage runs, kept
+    # and sent to the module as ÖBB's stop list (the runs already stored first).
+    try:
+        from .hafas_stop_list import start_in_worker
+
+        start_in_worker()
+    except Exception:
+        log.exception("hafas stop list thread not started (non-fatal)")
+
     while True:
         try:
             tick()

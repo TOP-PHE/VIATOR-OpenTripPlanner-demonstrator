@@ -129,6 +129,7 @@ Rules this client keeps on purpose:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -140,6 +141,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, TypeGuard
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -168,9 +170,28 @@ _STOP_KEY_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 FEED_KEY = re.compile(
     r"(?:nap:tdg:[1-9][0-9]{0,17}"
     r"|nap:(?:udata|permalink|dated|json_api):[0-9a-f]{16}"
-    r"|url:[0-9a-f]{16}|upload:[0-9a-f]{64})",
+    r"|url:[0-9a-f]{16}|upload:[0-9a-f]{64}|hafas:[0-9a-f]{16})",
     re.ASCII,
 )
+# The first part of the key of a stop list (the module's design 22.20, its
+# decisions 69 to 73): the places a HAFAS journey planner answered, which
+# VIATOR collects and sends as a feed of its own (`app/hafas_stop_list.py`).
+STOP_LIST_PREFIX = "hafas:"
+
+
+def hafas_identity(url: str) -> str:
+    """The feed key of the stop list made from the answers of the HAFAS
+    journey planner at `url` (the module's `feed_intake.hafas_identity`, its
+    design 22.2 point 6 and 22.20 point 2): `hafas:` and the first 16
+    hexadecimal digits of the sha256 of the host in small letters and the
+    path as given. No scheme, no port, no fragment and **no query** (a
+    request may carry a token of its own, which must not make a new feed):
+    one planner keeps one key from one list to the next."""
+    parts = urlsplit(url)
+    digest = hashlib.sha256(((parts.hostname or "") + parts.path).encode("utf-8"))
+    return STOP_LIST_PREFIX + digest.hexdigest()[:16]
+
+
 # A server-side call, off the keystroke path: up to three statements of 0.8 s
 # each in the module, so three seconds for the whole call.
 STOP_STATIONS_DEADLINE = 3.0

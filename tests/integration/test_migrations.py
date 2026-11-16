@@ -719,3 +719,63 @@ def test_verify_progress_revision_up_down_up(alembic_cfg: Config) -> None:
 
     command.upgrade(alembic_cfg, "head")
     assert _run_columns(engine) >= _VERIFY_COLUMNS
+
+
+# ── 20261116_1200_hafas_places: ÖBB's places for the module's stop list (its 22.20) ──
+
+_HAFAS_PLACES = "20261116_1200_hafas_places"
+_BEFORE_HAFAS_PLACES = "20261105_1200_alignment_detail"
+_HAFAS_TABLES = {"hafas_places", "hafas_place_runs"}
+
+
+def test_hafas_places_revision_up_down_up_and_its_checks(alembic_cfg: Config) -> None:
+    """The revision creates the two tables empty and changes nothing else; a number is digits,
+    a UIC seven digits, a place seen at least once; a run's row goes with its run; the downgrade
+    drops both tables and keeps the runs; a second upgrade works."""
+    url = _postgres_or_skip()
+    engine = create_engine(url)
+    with engine.begin() as conn:
+        conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE;"))
+        conn.execute(text("CREATE SCHEMA public;"))
+
+    command.upgrade(alembic_cfg, _BEFORE_HAFAS_PLACES)
+    assert not (_HAFAS_TABLES & set(inspect(engine).get_table_names()))
+    run_id = "99999999-9999-4999-8999-999999999599"
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO network_coverage_runs (id, session_label, depart_at, status) "
+                "VALUES (:id, 'zz-cov-99', '2099-09-09T00:00:00Z', 'completed')"
+            ),
+            {"id": run_id},
+        )
+
+    command.upgrade(alembic_cfg, _HAFAS_PLACES)
+    assert set(inspect(engine).get_table_names()) >= _HAFAS_TABLES
+    place = (
+        "INSERT INTO hafas_places (ext_id, name, lat, lon, uic, times_seen, first_seen_at, "
+        "last_seen_at) VALUES (:n, 'ZZ Nord', 49.99, 9.99, :uic, :seen, now(), now())"
+    )
+    with engine.begin() as conn:
+        conn.execute(text(place), {"n": "9900001", "uic": "9900001", "seen": 1})
+        conn.execute(
+            text("INSERT INTO hafas_place_runs (run_id, calls, places) VALUES (:id, 9, 1)"),
+            {"id": run_id},
+        )
+        assert conn.execute(text("SELECT operators FROM hafas_places")).scalar_one() == []
+    for bad in (
+        {"n": "99z", "uic": None, "seen": 1},
+        {"n": "9900002", "uic": "99", "seen": 1},
+        {"n": "9900003", "uic": None, "seen": 0},
+    ):
+        with pytest.raises(IntegrityError), engine.begin() as conn:
+            conn.execute(text(place), bad)
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM network_coverage_runs WHERE id = :id"), {"id": run_id})
+        assert conn.execute(text("SELECT count(*) FROM hafas_place_runs")).scalar_one() == 0
+        assert conn.execute(text("SELECT count(*) FROM hafas_places")).scalar_one() == 1
+
+    command.downgrade(alembic_cfg, _BEFORE_HAFAS_PLACES)
+    assert not (_HAFAS_TABLES & set(inspect(engine).get_table_names()))
+    command.upgrade(alembic_cfg, "head")
+    assert set(inspect(engine).get_table_names()) >= _HAFAS_TABLES

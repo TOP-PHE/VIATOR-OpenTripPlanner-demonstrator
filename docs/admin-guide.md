@@ -4878,9 +4878,11 @@ station each number is linked to and shows that station's name:
   deployed) answers that series with no station: the modal then shows ⚠ as
   before, nothing fails.
 - The coverage check's scoring and `/journey`'s comparison place ÖBB's stops
-  by the same series in the same order (the module's call for many stops,
-  `station_resolver`: the first series for every number, the next one only
-  for the numbers left without a station).
+  by **ÖBB's stop list first** (§11.7), then by the same series in the same
+  order (the module's call for many stops, `station_resolver`: the stop list
+  for every number, the first series for the numbers it leaves without a
+  station, the next one only for those the first leaves). The modal itself
+  still asks the series only (by `resolve`, which names the station).
 - What the modal shows: the module's station name (underlined dotted), and on
   hover ÖBB's number and name, the module's station, its MERITS code, how it
   matched (`code`, or a link with its tier) and the series it was found in.
@@ -4893,6 +4895,74 @@ station each number is linked to and shows that station's name:
 Nothing is written: no migration. The worker log has no line for it; the web
 log has `station_module.resolve_failed reason=<word>` when a call fails (never
 a number).
+
+### 11.7 ÖBB's stop list: the places ÖBB's planner answered, sent to the module
+
+ÖBB's NAP timetable carries no HAFAS number, and `DELFI_stop_key` answers ÖBB's
+numbers in Germany and Austria only. So VIATOR keeps the places ÖBB HAFAS
+answered in the coverage runs and sends them to the module as a **stop list**,
+a feed of its own, which the module matches to its stations and does nothing
+else with (the module's design 22.20, the owner's decisions 69 to 73 of 13 Nov
+2026). VIATOR then asks an ÖBB stop by that list first.
+
+- **What is listed** (`app/network_coverage/hafas_places.py`, table
+  `hafas_places`): one row per HAFAS place of type station (`A=1` in its lid)
+  where a train of ÖBB's answers starts or ends a leg: its number (`extId`), its
+  name and position as HAFAS last gave them, the UIC code its `gidL` states
+  (`U×…`, when one was seen), the train calls seen there, when first and last,
+  and the operators of those legs. A bus stop beside a station (a HAFAS station
+  too) is never listed. The coverage check asks ÖBB **without pass lists**
+  (`getPasslist: false`), so only the stations where a train is boarded, left
+  or changed are seen, never the stops in between (way b of decision 70, ÖBB's
+  international trains, will add those). ÖBB journeys stored before this
+  change keep a UIC only where ÖBB states the number itself as one (DE, AT,
+  CH mostly); since it, every stated UIC is kept (`codes.HAFAS_UIC`).
+- **When**: the worker's thread `hafas-stop-list` adds every ended run with the
+  ÖBB check (completed, cancelled or failed) once (`hafas_place_runs`), first
+  all the runs already stored, then the new ones every 10 minutes. The list
+  never shrinks: a run that asked other pairs adds to it, a run deleted keeps
+  its places. Then it sends the list when the module does not hold its version
+  yet: the stop extract of §11.4 (`stop_key` the number, `codes`
+  `extId=<number>` and `uic=<code>`, `modes` `RAIL_MAIN`, `n_calls` the calls
+  seen, `iso2_point` from the position, provider `OEBB_HAFAS`, country `AT`),
+  by the two calls of §11.5 (`HEAD`, then `PUT` when it lacks it). Its feed key
+  is `hafas:36f5256aac2ac2c0` (the first 16 hex digits of the sha256 of
+  `fahrplan.oebb.at/bin/mgate.exe`, the module's `hafas_identity`), its version
+  the sha256 of the places. Without the module configured the list is kept and
+  nothing is sent.
+- **Operators**: every row carries one operator, `ÖBB`. The module holds a new
+  version of a feed for review when its set of operators changes (its 22.4);
+  with the operators of the legs, most new versions of a growing list would
+  wait for an administrator, and a stop list has no rule for them to scope
+  (the module's 22.20, "Left open", 1). The table keeps the legs' operators.
+- **What the owner does once**: accept the feed `hafas:36f5256aac2ac2c0`
+  (provider `OEBB_HAFAS`) on the module's **Timetable feeds** screen, with its
+  licence and attribution (decision 69). Until then it is `pending`: the module
+  matches nothing of it and the lookup falls back on the series, as before.
+  Stops the module cannot match automatically go to its review queue
+  (decision 73).
+- **The lookup**: for an ÖBB stop, `{"feed": "hafas:36f5256aac2ac2c0",
+  "stops": [numbers]}` first, then `COVERAGE_OEBB_STOP_SERIES` in its order,
+  each asked only for the numbers the one before places nowhere (a number of
+  several stations is not settled by the next). The list is asked only when
+  the setting names a series (an empty setting leaves ÖBB's stops out). Each
+  number asked costs one key of the module's 100,000 a day, so a number the
+  list does not place costs one more than before; answers are kept 6 hours.
+- **By hand** (counts only, never a number with its station):
+  `docker compose -p viator exec -T worker python -m app.hafas_stop_list --totals`
+  prints the runs added, the places, the calls, the places outside Germany and
+  Austria (by the country of the position), those with a UIC code, and the
+  places by country. Without `--totals` it first adds the ended runs and sends
+  the list, and prints the outcome (`sent`, `held`, `refused <word>`...).
+- **Logs** (worker): `hafas_places.collected runs= calls= listed= failed=`,
+  `hafas_places.run_failed error=<type>` (that run is tried again at the next
+  pass), `hafas_stop_list.<state> places= reason=`, and the sender's
+  `station_extract.*` lines with provider `OEBB_HAFAS`. Never a number, a name
+  or a position.
+
+Revision `20261116_1200_hafas_places` creates the two tables, empty; the first
+pass of the worker fills them from the runs stored. Its downgrade drops them
+(the next upgrade rebuilds the list from the runs still stored).
 
 ---
 

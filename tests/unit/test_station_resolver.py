@@ -450,3 +450,97 @@ async def test_a_failure_in_the_first_series_asks_no_other(module: Module) -> No
 
     assert await ModuleStationResolver(FEEDS, BOTH).resolve(_numbers("8700012")) == {}
     assert module.calls == [(CODE, SERIES, ["8700012"])]
+
+
+# ── ÖBB's stop list first (the module's 22.20, decision 72) ───────────────────────────────
+
+LIST = "hafas:" + "9" * 16
+
+
+def test_an_oebb_stop_is_asked_in_the_stop_list_then_in_each_series() -> None:
+    stop = oebb_stop(codes={"OEBB_EXT": "9900012"})
+
+    assert keys_of(stop, FEEDS, BOTH, LIST) == [
+        (STOP, LIST, "9900012"),
+        (CODE, SERIES, "9900012"),
+        (CODE, FALLBACK, "9900012"),
+    ]
+    # No series set: ÖBB's stops are left out, the stop list too.
+    assert keys_of(stop, FEEDS, (), LIST) == []
+    # A resolver without the list asks the series alone, as before.
+    assert keys_of(stop, FEEDS, BOTH) == [(CODE, SERIES, "9900012"), (CODE, FALLBACK, "9900012")]
+
+
+def test_the_stop_list_is_the_one_of_oebbs_planner_in_the_module_s_form() -> None:
+    from app.network_coverage.external_verify import OEBB_ENDPOINT
+
+    expected = station_module.hafas_identity(OEBB_ENDPOINT)
+    assert expected == station_resolver.OEBB_STOP_LIST
+    assert station_module.FEED_KEY.fullmatch(station_resolver.OEBB_STOP_LIST)
+
+
+async def test_the_series_are_asked_only_for_the_numbers_the_stop_list_places_nowhere(
+    module: Module,
+) -> None:
+    module.stations[(STOP, LIST, "9900001")] = [("ZZ-99001", None)]
+    module.stations[(CODE, SERIES, "9900002")] = [("ZZ-99002", None)]
+    module.stations[(CODE, FALLBACK, "9900003")] = [("ZZ-99003", None)]
+    # The series are never asked for a number the list placed, even if they would answer it.
+    module.stations[(CODE, SERIES, "9900001")] = [("ZZ-99009", None)]
+
+    placed = await ModuleStationResolver(FEEDS, BOTH, LIST).resolve(
+        _numbers("9900001", "9900002", "9900003", "9900004")
+    )
+
+    assert placed == {
+        ("hafas:oebb", "A=1@L=9900001@"): ResolvedStation(station_id="ZZ-99001"),
+        ("hafas:oebb", "A=1@L=9900002@"): ResolvedStation(station_id="ZZ-99002"),
+        ("hafas:oebb", "A=1@L=9900003@"): ResolvedStation(station_id="ZZ-99003"),
+    }
+    assert module.calls == [
+        (STOP, LIST, ["9900001", "9900002", "9900003", "9900004"]),
+        (CODE, SERIES, ["9900002", "9900003", "9900004"]),
+        (CODE, FALLBACK, ["9900003", "9900004"]),
+    ]
+
+
+async def test_a_number_of_several_stations_in_the_stop_list_is_not_settled_by_a_series(
+    module: Module,
+) -> None:
+    module.stations[(STOP, LIST, "9900001")] = [("ZZ-99001", None), ("ZZ-99002", None)]
+    module.stations[(CODE, SERIES, "9900001")] = [("ZZ-99003", None)]
+
+    placed = await ModuleStationResolver(FEEDS, BOTH, LIST).resolve(_numbers("9900001"))
+
+    assert placed == {}
+    assert module.calls == [(STOP, LIST, ["9900001"])]
+
+
+async def test_a_feed_s_stops_are_asked_beside_the_stop_list(module: Module) -> None:
+    module.stations[(STOP, DB_FEED, "8000105")] = [("ZZ-99002", None)]
+    module.stations[(CODE, SERIES, "9900012")] = [("ZZ-99003", None)]
+
+    placed = await ModuleStationResolver(FEEDS, BOTH, LIST).resolve(
+        [motis_stop("db_8000105"), *_numbers("9900012")]
+    )
+
+    assert set(placed) == {("motis:db", "db_8000105"), ("hafas:oebb", "A=1@L=9900012@")}
+    assert sorted(module.calls[:2]) == [(STOP, LIST, ["9900012"]), (STOP, DB_FEED, ["8000105"])]
+    assert module.calls[2:] == [(CODE, SERIES, ["9900012"])]
+
+
+async def test_a_failure_of_the_stop_list_asks_no_series(module: Module) -> None:
+    module.reason = "timeout"
+
+    assert await ModuleStationResolver(FEEDS, BOTH, LIST).resolve(_numbers("9900012")) == {}
+    assert module.calls == [(STOP, LIST, ["9900012"])]
+
+
+async def test_the_stop_list_s_answers_are_kept_like_the_others(module: Module) -> None:
+    module.stations[(CODE, SERIES, "9900012")] = [("ZZ-99003", None)]
+    resolver = ModuleStationResolver(FEEDS, BOTH, LIST)
+    first = await resolver.resolve(_numbers("9900012"))
+    module.calls.clear()
+
+    assert await resolver.resolve(_numbers("9900012")) == first
+    assert module.calls == []

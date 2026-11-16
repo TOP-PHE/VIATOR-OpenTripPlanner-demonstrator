@@ -90,8 +90,10 @@ def test_a_stop_is_given_a_uic_only_when_oebb_states_its_own_number_as_one(
     assert place is not None
     assert place.uic == uic
     # The number stays where the station module looks for it, and never becomes a token whose
-    # 7 digits could be read back as a UIC downstream (`_oebb_opaque_payload`'s invariant).
-    assert place.codes == {"OEBB_EXT": loc["extId"]}
+    # 7 digits could be read back as a UIC downstream (`_oebb_opaque_payload`'s invariant). The
+    # UIC `gidL` states, equal or not, is kept beside it for ÖBB's stop list (`HAFAS_UIC`).
+    stated = hafas_adapter.stated_uic(loc.get("gidL"))
+    assert place.codes == {"OEBB_EXT": loc["extId"], **({"HAFAS_UIC": stated} if stated else {})}
     assert place.unresolved_token is None
     expected_key = (
         f"UIC:{uic}" if uic else f"GEO:{loc['crd']['y'] / 1e6:.3f},{loc['crd']['x'] / 1e6:.3f}"

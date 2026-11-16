@@ -161,7 +161,7 @@ RAIL_BY_DEFAULT_SUFFIX = "+rail-default"
 FEED_KEY_PATTERN = (
     r"(?:nap:tdg:[1-9][0-9]{0,17}"
     r"|nap:(?:udata|permalink|dated|json_api):[0-9a-f]{16}"
-    r"|url:[0-9a-f]{16}|upload:[0-9a-f]{64})"
+    r"|url:[0-9a-f]{16}|upload:[0-9a-f]{64}|hafas:[0-9a-f]{16})"
 )
 FEED_KEY = re.compile(FEED_KEY_PATTERN, re.ASCII)
 
@@ -1082,6 +1082,53 @@ def build_extract(
         raise ExtractError(MEMORY_LIMIT, OUT_OF_MEMORY) from None
     except Exception as exc:
         raise ExtractError("error", type(exc).__name__) from None
+
+
+@dataclass(frozen=True)
+class ListedFeed:
+    """A feed made from no archive, whose stations VIATOR holds itself (the HAFAS stop list,
+    `app/hafas_stop_list.py`, the module's design 22.20): the columns of 22.2 that are the same
+    on every row."""
+
+    feed_key: str
+    feed_version: str
+    extractor_version: str
+    provider_id: str
+    provider_label: str
+    provider_country_iso: str
+    provider_provenance: str = ""
+
+
+def write_listed_extract(
+    stations: dict[str, Station], feed: ListedFeed, target: Path, *, extracted_at: datetime
+) -> ExtractResult:
+    """Write the extract of a feed made from no archive to `target` (gzip): the rows, the
+    cleaning and MSMM's limits of every extract (`_station_row`, `_write`), the country of each
+    position included. Raises `ExtractError` when no extract can be written (no row, a limit)."""
+    if FEED_KEY.fullmatch(feed.feed_key) is None:
+        raise ExtractError("no_feed_key", "a feed key MSMM does not take")
+    if _SHA256.fullmatch(feed.feed_version) is None:
+        raise ExtractError("bad_sha256", "the feed version is not a sha256")
+    if _PROVIDER_ID.fullmatch(feed.provider_id) is None:
+        raise ExtractError("bad_provider", "the provider id is not a VIATOR provider id")
+    if extracted_at.tzinfo is None:
+        raise ExtractError("bad_time", "extracted_at has no time zone")
+    provenance = feed.provider_provenance if feed.provider_provenance in PROVENANCES else ""
+    country = feed.provider_country_iso if _ISO2.fullmatch(feed.provider_country_iso) else ""
+    meta = _Meta(
+        feed_key=feed.feed_key,
+        feed_version=feed.feed_version,
+        extracted_at=extracted_at.astimezone(UTC).isoformat(timespec="seconds"),
+        provider_id=feed.provider_id,
+        provider_label=_clean_label(feed.provider_label, Counter()),
+        provider_country_iso=country,
+        provider_provenance=provenance,
+        extractor_version=feed.extractor_version,
+        default_rail=False,
+    )
+    dropped: Counter[str] = Counter()
+    _write(stations, meta, target, dropped)
+    return _describe(target, meta, dropped, "")
 
 
 # ── The extract, in a child process ───────────────────────────────────────

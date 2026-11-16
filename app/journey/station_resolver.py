@@ -16,12 +16,15 @@ Nothing compares `station_id` yet: the matching engine of #304 will (its design 
     first, then the stop itself (a stop without a parent is its own station);
   * an OTP stop (`otp:<feed>`, `<feed>:<local>`): the provider of that id, the stop itself;
   * an ÖBB HAFAS stop (`hafas:oebb`): its number (`extId`, else the number of its `UIC:` or
-    `OEBB:` token, as the coverage cell modal asks it) in the code series of
-    `COVERAGE_OEBB_STOP_SERIES`, in their order (`DELFI_stop_key`: measured 27 Oct, CLAUDE.md §3;
-    then `Trainline_EVA`, the module's design 22.19, for the numbers outside Germany and
-    Austria); a series is asked only for the numbers the series before it places nowhere (the
-    module's decision 72), so a code of several stations in one series is never settled by the
-    next;
+    `OEBB:` token, as the coverage cell modal asks it), first as a stop of ÖBB's stop list
+    (`OEBB_STOP_LIST`, the feed `hafas:…` of the places ÖBB's planner answered, which VIATOR
+    sends the module: its design 22.20, `app/hafas_stop_list.py`; ÖBB's own numbers, matched
+    and reviewed there), then in the code series of `COVERAGE_OEBB_STOP_SERIES`, in their order
+    (`DELFI_stop_key`: measured 27 Oct, CLAUDE.md §3; then `Trainline_EVA`, the module's design
+    22.19, for the numbers outside Germany and Austria); each is asked only for the numbers the
+    one before it places nowhere (the module's decision 72), so a key of several stations is
+    never settled by the next. The stop list is asked only when a series is set (an empty
+    setting leaves ÖBB's stops out) and when the resolver is given it (`oebb_stop_list`);
   * anything else (an OJP stop, a provider with no feed key: a derived feed, an upload whose
     file is unknown): not asked.
 
@@ -49,6 +52,7 @@ from enum import Enum
 from typing import Any
 
 from .. import station_module
+from ..network_coverage.external_verify import OEBB_ENDPOINT
 from .canonical.canonical_stop_place import CanonicalStopPlace
 from .canonical.station_resolution import ResolvedStation, StopKey
 
@@ -64,6 +68,9 @@ MOTIS_PREFIX = "motis:"
 OTP_PREFIX = "otp:"
 OEBB_SOURCE = "hafas:oebb"
 OEBB_EXT = "OEBB_EXT"
+# The feed key of ÖBB's stop list: the places ÖBB's planner answered, collected by VIATOR and
+# sent to the module (its design 22.20; `app/hafas_stop_list.py`), keyed by the planner's address.
+OEBB_STOP_LIST = station_module.hafas_identity(OEBB_ENDPOINT)
 
 # A key of the module: ("stop", feed key, stop key) or ("code", series, code).
 ModuleKey = tuple[str, str, str]
@@ -184,10 +191,14 @@ def _token_number(token: str | None) -> str | None:
 
 
 def keys_of(
-    stop: CanonicalStopPlace, feeds: SessionFeeds, oebb_series: tuple[str, ...]
+    stop: CanonicalStopPlace,
+    feeds: SessionFeeds,
+    oebb_series: tuple[str, ...],
+    oebb_stop_list: str | None = None,
 ) -> list[ModuleKey]:
     """The keys `stop` is asked by, the one to trust first first; none when the module cannot
-    know it. An ÖBB stop's are its number in each series of `oebb_series`, in their order."""
+    know it. An ÖBB stop's are its number as a stop of `oebb_stop_list` (when given), then in
+    each series of `oebb_series`, in their order."""
     if stop.source.startswith(MOTIS_PREFIX):
         dataset = stop.source[len(MOTIS_PREFIX) :]
         feed = feeds.motis.get(dataset)
@@ -202,8 +213,20 @@ def keys_of(
         return [] if feed is None or local is None else [(STOP, feed, local)]
     if stop.source == OEBB_SOURCE and oebb_series:
         number = _oebb_number(stop)
-        return [] if number is None else [(CODE, series, number) for series in oebb_series]
+        if number is None:
+            return []
+        listed: list[ModuleKey] = []
+        if oebb_stop_list is not None and station_module.stop_key_refused(number) is None:
+            listed.append((STOP, oebb_stop_list, number))
+        return listed + [(CODE, series, number) for series in oebb_series]
     return []
+
+
+def _in_turn(key: ModuleKey) -> bool:
+    """Whether a key is asked only once the one before it is known to place nowhere: a code
+    (ÖBB's number in a series) and a stop of a stop list (ÖBB's number in its stop list), never a
+    stop of a timetable (a feed's stop and its parent are asked together)."""
+    return key[0] == CODE or key[1].startswith(station_module.STOP_LIST_PREFIX)
 
 
 def batches(keys: Iterable[ModuleKey]) -> list[tuple[str, str, list[str]]]:
@@ -261,31 +284,35 @@ def _walk(
 ) -> tuple[ResolvedStation | None, list[ModuleKey]]:
     """The station a stop's `keys` give with the `answers` known, and the keys to ask before it
     is settled. The keys are trusted in their order: the first with one station gives it. A
-    feed's stop keys not known yet are asked together; a code (ÖBB's number in a series) only
-    once the code before it is known to be placed nowhere, and a code of several stations ends
-    the list: the next series answers only where the one before is silent (the module's
-    decision 72)."""
+    feed's stop keys not known yet are asked together; ÖBB's number (in its stop list, then in
+    each series: `_in_turn`) only once the key before it is known to be placed nowhere, and
+    such a key of several stations ends the list: the next answers only where the one before is
+    silent (the module's decision 72)."""
     to_ask: list[ModuleKey] = []
     for key in keys:
         answer = answers.get(key)
         if answer is None:
             to_ask.append(key)
-            if key[0] == CODE:
+            if _in_turn(key):
                 break
         elif isinstance(answer, ResolvedStation):
             return answer, to_ask
-        elif answer is Unplaced.SEVERAL and key[0] == CODE:
+        elif answer is Unplaced.SEVERAL and _in_turn(key):
             break
     return None, to_ask
 
 
 def resolver_for_session(
-    config: Mapping[str, Any], upload_sha256: Mapping[str, str], oebb_series: tuple[str, ...]
+    config: Mapping[str, Any],
+    upload_sha256: Mapping[str, str],
+    oebb_series: tuple[str, ...],
+    oebb_stop_list: str | None = None,
 ) -> ModuleStationResolver:
     """The resolver of a session's journeys: its `config` (`sessions.config`), the sha256 of
-    the latest file uploaded for each provider (`station_extract_upload.latest_upload_sha256`)
-    and the code series of ÖBB's numbers, in their order (`oebb_stop_series`). A configuration
-    that does not read gives a resolver that places only ÖBB's stops."""
+    the latest file uploaded for each provider (`station_extract_upload.latest_upload_sha256`),
+    ÖBB's stop list (`OEBB_STOP_LIST`, or None) and the code series of ÖBB's numbers, in their
+    order (`oebb_stop_series`). A configuration that does not read gives a resolver that places
+    only ÖBB's stops."""
     from .. import ingestion, station_extract
 
     try:
@@ -298,27 +325,37 @@ def resolver_for_session(
             provider, upload_sha256=upload_sha256.get(str(provider.get("id")))
         )
 
-    return ModuleStationResolver(session_feeds(providers, key_of), oebb_series)
+    return ModuleStationResolver(session_feeds(providers, key_of), oebb_series, oebb_stop_list)
 
 
 class ModuleStationResolver:
-    """The `StationResolver` of one session's journeys (its feeds) and of ÖBB's (the code
-    series of `COVERAGE_OEBB_STOP_SERIES`, in their order: `oebb_stop_series`; none to leave
-    ÖBB's stops out)."""
+    """The `StationResolver` of one session's journeys (its feeds) and of ÖBB's: its stop list
+    first (`oebb_stop_list`, `OEBB_STOP_LIST`; None to leave it out), then the code series of
+    `COVERAGE_OEBB_STOP_SERIES`, in their order (`oebb_stop_series`; none to leave ÖBB's stops
+    out)."""
 
-    def __init__(self, feeds: SessionFeeds, oebb_series: tuple[str, ...]) -> None:
+    def __init__(
+        self,
+        feeds: SessionFeeds,
+        oebb_series: tuple[str, ...],
+        oebb_stop_list: str | None = None,
+    ) -> None:
         self._feeds = feeds
         self._oebb_series = oebb_series
+        self._oebb_stop_list = oebb_stop_list
 
     async def resolve(
         self, stops: Sequence[CanonicalStopPlace]
     ) -> Mapping[StopKey, ResolvedStation]:
         """The stations of the stops the module places; a stop it does not is absent. Asked in
         rounds: the answers kept are read first, then each round asks the keys still needed (a
-        feed's stops at once, ÖBB's numbers one series a round, only those the series before
-        placed nowhere), until every stop is settled or a call fails."""
+        feed's stops at once, ÖBB's numbers in its stop list, then one series a round, only those
+        the one before placed nowhere), until every stop is settled or a call fails."""
         wanted = {
-            (stop.source, stop.ref): keys_of(stop, self._feeds, self._oebb_series) for stop in stops
+            (stop.source, stop.ref): keys_of(
+                stop, self._feeds, self._oebb_series, self._oebb_stop_list
+            )
+            for stop in stops
         }
         answers: dict[ModuleKey, Answer] = {}
         for keys in wanted.values():

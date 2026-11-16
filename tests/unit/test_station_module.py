@@ -2589,3 +2589,32 @@ async def test_stop_stations_refuses_a_body_the_module_would_refuse(
         await station_module.stop_stations_outcome(**form)
 
     assert module.requests == []
+
+
+# ── ÖBB's stop list: the `hafas:` key (the module's 22.2 point 6, 22.20) ────────────────────
+
+
+def test_the_key_of_a_stop_list_is_the_sha256_of_the_planner_s_host_and_path() -> None:
+    import hashlib
+
+    digest = hashlib.sha256(b"zz.invalid/bin/mgate.exe").hexdigest()[:16]
+
+    assert station_module.hafas_identity("https://zz.invalid/bin/mgate.exe") == f"hafas:{digest}"
+    # The host in small letters; no scheme, port, query (a request's own token) or fragment.
+    for url in (
+        "http://ZZ.Invalid:9999/bin/mgate.exe",
+        "https://zz.invalid/bin/mgate.exe?rnd=99&aid=zz#top",
+    ):
+        assert station_module.hafas_identity(url) == f"hafas:{digest}"
+    # The path is kept as given: another path is another planner.
+    assert station_module.hafas_identity("https://zz.invalid/bin/MGATE.exe") != f"hafas:{digest}"
+
+
+def test_a_stop_list_s_stops_are_asked_by_its_key() -> None:
+    key = station_module.hafas_identity("https://zz.invalid/bin/mgate.exe")
+
+    body = station_module.stop_stations_body(feed=key, stops=["9900001", "9900002"])
+
+    assert json.loads(body) == {"feed": key, "stops": ["9900001", "9900002"]}
+    with pytest.raises(ValueError):
+        station_module.stop_stations_body(feed="hafas:" + "9" * 15, stops=["9900001"])
