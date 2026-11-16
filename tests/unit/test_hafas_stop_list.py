@@ -335,3 +335,100 @@ def test_a_listed_extract_refuses_what_the_module_would(extractor: Any, tmp_path
     with pytest.raises(extractor.ExtractError) as naive:
         extractor.write_listed_extract(stations, feed, target, extracted_at=datetime(2099, 9, 9))
     assert naive.value.reason == "bad_time"
+
+
+# ── the worker's thread and the command ─────────────────────────────────────
+
+
+def test_the_thread_starts_once_a_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading
+
+    served = threading.Event()
+    monkeypatch.setattr(StopListWorker, "serve_forever", lambda _self: served.set())
+    monkeypatch.setattr(hsl, "_started", None)
+
+    first = hsl.start_in_worker(lambda: contextlib.nullcontext(object()))
+    first.join(5)
+    assert served.is_set()
+    assert first.name == "hafas-stop-list"
+
+    blocked = threading.Event()
+    monkeypatch.setattr(StopListWorker, "serve_forever", lambda _self: blocked.wait(5))
+    second = hsl.start_in_worker(lambda: contextlib.nullcontext(object()))
+    assert hsl.start_in_worker(lambda: contextlib.nullcontext(object())) is second
+    blocked.set()
+    second.join(5)
+
+
+def test_the_thread_outlives_a_pass_that_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    passes: list[int] = []
+
+    class Stop(BaseException):
+        """Ends the loop after its second pause (a BaseException, as nothing catches it)."""
+
+    def fail_once(_self: Any) -> None:
+        passes.append(1)
+        raise RuntimeError("zz")
+
+    def pause(_seconds: float) -> None:
+        if len(passes) >= 2:
+            raise Stop
+
+    monkeypatch.setattr(StopListWorker, "pass_once", fail_once)
+    monkeypatch.setattr(hsl.time, "sleep", pause)
+
+    with pytest.raises(Stop):
+        StopListWorker(lambda: contextlib.nullcontext(object())).serve_forever(0.0)
+    assert len(passes) == 2
+
+
+class Command:
+    """The command's stand-ins: the database, the collection, the send and the totals."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from app import db as app_db
+        from app.network_coverage import hafas_places
+
+        self.collected = 0
+        self.sent: list[list[ListedPlace]] = []
+        monkeypatch.setattr(app_db, "SessionLocal", lambda: contextlib.nullcontext(object()))
+        monkeypatch.setattr(hafas_places, "collect_pending", self.collect)
+        monkeypatch.setattr(hsl, "load_places", lambda _db: [NORD])
+        monkeypatch.setattr(hsl, "send_list", self.send)
+        totals = hafas_places.Totals(1, 9, 0, 0, 1, 0, 1, {"AT": 1})
+        monkeypatch.setattr(hafas_places, "totals", lambda _db: totals)
+
+    def collect(self, _factory: Any) -> None:
+        self.collected += 1
+
+    def send(self, places: Sequence[ListedPlace]) -> Sent:
+        self.sent.append(list(places))
+        return Sent("refused", "row", "9" * 64, len(places))
+
+
+def test_the_command_adds_sends_and_prints_counts_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    command = Command(monkeypatch)
+
+    assert hsl.main([]) == 0
+
+    out = capsys.readouterr().out.splitlines()
+    assert command.collected == 1
+    assert command.sent == [[NORD]]
+    assert "places (HAFAS stations with a train call): 1" in out
+    assert out[-1] == "stop list: refused (row)"
+    assert not any("9900001" in line or "ZZ Nord" in line for line in out)
+
+
+def test_the_command_with_totals_only_adds_and_sends_nothing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    command = Command(monkeypatch)
+
+    assert hsl.main(["--totals"]) == 0
+
+    out = capsys.readouterr().out.splitlines()
+    assert (command.collected, command.sent) == (0, [])
+    assert "by country: AT 1" in out
+    assert not any(line.startswith("stop list:") for line in out)
