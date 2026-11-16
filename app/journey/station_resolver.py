@@ -212,14 +212,21 @@ def keys_of(
         local = _local(stop.ref, feed_id, ":") if feed is not None else None
         return [] if feed is None or local is None else [(STOP, feed, local)]
     if stop.source == OEBB_SOURCE and oebb_series:
-        number = _oebb_number(stop)
-        if number is None:
-            return []
-        listed: list[ModuleKey] = []
-        if oebb_stop_list is not None and station_module.stop_key_refused(number) is None:
-            listed.append((STOP, oebb_stop_list, number))
-        return listed + [(CODE, series, number) for series in oebb_series]
+        return _oebb_keys(stop, oebb_series, oebb_stop_list)
     return []
+
+
+def _oebb_keys(
+    stop: CanonicalStopPlace, oebb_series: tuple[str, ...], oebb_stop_list: str | None
+) -> list[ModuleKey]:
+    """An ÖBB stop's keys: its number in the stop list (when given), then in each series."""
+    number = _oebb_number(stop)
+    if number is None:
+        return []
+    listed: list[ModuleKey] = []
+    if oebb_stop_list is not None and station_module.stop_key_refused(number) is None:
+        listed.append((STOP, oebb_stop_list, number))
+    return listed + [(CODE, series, number) for series in oebb_series]
 
 
 def _in_turn(key: ModuleKey) -> bool:

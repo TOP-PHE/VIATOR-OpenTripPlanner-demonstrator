@@ -377,8 +377,9 @@ def test_the_thread_outlives_a_pass_that_fails(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(StopListWorker, "pass_once", fail_once)
     monkeypatch.setattr(hsl.time, "sleep", pause)
 
+    worker = StopListWorker(lambda: contextlib.nullcontext(object()))
     with pytest.raises(Stop):
-        StopListWorker(lambda: contextlib.nullcontext(object())).serve_forever(0.0)
+        worker.serve_forever(0.0)
     assert len(passes) == 2
 
 

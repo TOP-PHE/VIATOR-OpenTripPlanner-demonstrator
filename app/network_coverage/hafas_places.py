@@ -34,7 +34,7 @@ import logging
 import math
 import uuid
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -205,27 +205,34 @@ def add_journeys(places: dict[str, SeenPlace], journeys: object, at: datetime) -
     """Add the train calls of one cell's stored journeys (`external_journeys`, a list of
     canonical journey JSON) to `places`; the number of calls added. Anything that does not read
     is passed over."""
-    if not isinstance(journeys, list):
-        return 0
     calls = 0
+    for leg in _train_legs(journeys):
+        operator = _operator(leg)
+        for side in ("origin", "destination"):
+            end = station_end(leg.get(side))
+            if end is not None:
+                _see(places, end, operator, at)
+                calls += 1
+    return calls
+
+
+def _train_legs(journeys: object) -> Iterator[Mapping[str, Any]]:
+    """The train legs of a list of canonical journey JSON; anything that does not read is
+    passed over."""
+    if not isinstance(journeys, list):
+        return
     for journey in journeys:
         legs = journey.get("legs") if isinstance(journey, Mapping) else None
         for leg in legs if isinstance(legs, list) else ():
-            if not isinstance(leg, Mapping) or not train_leg(leg):
-                continue
-            operator = _operator(leg)
-            for side in ("origin", "destination"):
-                end = station_end(leg.get(side))
-                if end is None:
-                    continue
-                place = places.get(end.number)
-                if place is None:
-                    place = places[end.number] = SeenPlace(
-                        end.number, end.name, end.lat, end.lon, at, at
-                    )
-                place.see(end.name, end.lat, end.lon, end.uic, operator, at)
-                calls += 1
-    return calls
+            if isinstance(leg, Mapping) and train_leg(leg):
+                yield leg
+
+
+def _see(places: dict[str, SeenPlace], end: _End, operator: str | None, at: datetime) -> None:
+    place = places.get(end.number)
+    if place is None:
+        place = places[end.number] = SeenPlace(end.number, end.name, end.lat, end.lon, at, at)
+    place.see(end.name, end.lat, end.lon, end.uic, operator, at)
 
 
 # ── the database ─────────────────────────────────────────────────────────
