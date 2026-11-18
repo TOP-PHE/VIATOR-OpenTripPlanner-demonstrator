@@ -169,6 +169,14 @@ CONFIG_SCHEMA: dict[str, FieldSpec] = {
     # A series is the module's data (its links file, its master), never
     # guessed: change it here when the module files them under another one.
     "COVERAGE_OEBB_STOP_SERIES": {"type": "str", "default": "DELFI_stop_key,Trainline_EVA"},
+    # The code series of the station module under which a station's German DHID (IFOPT,
+    # `de:09162:100` for München Hbf) is filed, separated by commas, in the order they are
+    # asked. DB's NeTEx names its German stations by DHID with no parent, and the extract of
+    # that feed holds its StopPlaces only (`DE::StopPlace:…`): such a stop of a journey is asked
+    # by its station's DHID here, after its feed's key (`station_resolver._dhid`). The module
+    # files the master's `ifopt_dhid` under this series; a module without it answers no
+    # station. Empty: DHID-named stops are not asked by a code.
+    "COVERAGE_IFOPT_STOP_SERIES": {"type": "str", "default": "IFOPT_DHID"},
     # ── Coverage matching (#304, docs/journey-matching-engine-design.md §10) ──
     # How the ÖBB check pairs a cell's VIATOR journeys with ÖBB's: the profile
     # `coverage_alignment` of `app/journey/matching/profiles.py` with these laid

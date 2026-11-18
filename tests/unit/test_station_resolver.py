@@ -24,7 +24,7 @@ from app.journey.station_resolver import (
     SessionFeeds,
     batches,
     keys_of,
-    oebb_stop_series,
+    series_setting,
     session_feeds,
 )
 
@@ -161,6 +161,69 @@ def test_other_db_stops_get_no_eva_number(ref: str) -> None:
     assert keys_of(motis_stop(ref), FEEDS, BOTH) == [(STOP, DB_FEED, ref.removeprefix("db_"))]
 
 
+# ── Stops DB names by a German DHID (run 09d13313, 18 Nov) ─────────────────────────────────
+
+IFOPT = ("IFOPT_DHID",)
+
+
+@pytest.mark.parametrize(
+    ("ref", "parent", "dhid"),
+    [
+        pytest.param("db_de:09162:100", None, "de:09162:100", id="a station: München Hbf"),
+        pytest.param("db_de:09162:100:3:5", None, "de:09162:100", id="one of its quays"),
+        pytest.param("db_de:09162:100:3:5", "db_de:09162:100:3", "de:09162:100", id="its area"),
+        pytest.param("db_x", "db_de:09163:9", "de:09163:9", id="the parent's"),
+    ],
+)
+def test_a_dhid_named_stop_is_asked_by_its_station_s_dhid(
+    ref: str, parent: str | None, dhid: str
+) -> None:
+    stop = motis_stop(ref, parent=parent)
+
+    keys = keys_of(stop, FEEDS, BOTH, IFOPT)
+
+    assert keys[-1] == (CODE, "IFOPT_DHID", dhid)
+    # After the feed's keys, never instead of them.
+    assert [kind for kind, _, _ in keys[:-1]] == [STOP] * (len(keys) - 1)
+    assert len(keys) > 1
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        pytest.param("db_at:47:1187", id="an Austrian id: no AGS"),
+        pytest.param("db_de:0916:100", id="four digits"),
+        pytest.param("db_de:09162:x", id="no number"),
+        pytest.param("db_xde:09162:100", id="not at the start"),
+        pytest.param("db_DE::ScheduledStopPoint:8100002_DBDB_::", id="an EVA-named point"),
+    ],
+)
+def test_other_stops_get_no_dhid(ref: str) -> None:
+    assert all(
+        owner != "IFOPT_DHID" for _, owner, _ in keys_of(motis_stop(ref), FEEDS, BOTH, IFOPT)
+    )
+
+
+def test_a_dhid_is_asked_through_otp_and_without_the_setting_never() -> None:
+    otp = CanonicalStopPlace(ref="FR-SNCF:de:09162:100", source="otp:FR-SNCF")
+
+    assert keys_of(otp, FEEDS, BOTH, IFOPT) == [
+        (STOP, OTP_FEED, "de:09162:100"),
+        (CODE, "IFOPT_DHID", "de:09162:100"),
+    ]
+    assert keys_of(otp, FEEDS, BOTH) == [(STOP, OTP_FEED, "de:09162:100")]
+
+
+def test_the_ifopt_setting_and_its_place_on_the_config_page() -> None:
+    from pathlib import Path
+
+    from app.config_schema import CONFIG_SCHEMA
+
+    assert CONFIG_SCHEMA["COVERAGE_IFOPT_STOP_SERIES"] == {"type": "str", "default": "IFOPT_DHID"}
+    page = Path(__file__).resolve().parents[2] / "app" / "templates" / "admin" / "config.html"
+    assert "'COVERAGE_IFOPT_STOP_SERIES'" in page.read_text(encoding="utf-8")
+
+
 def test_a_db_point_is_asked_by_its_number_without_a_feed_key_or_through_otp() -> None:
     unknown_feed = CanonicalStopPlace(
         ref="zz_DE::ScheduledStopPoint:8100002_DBDB_::", source="motis:zz"
@@ -191,7 +254,7 @@ def test_a_db_point_is_asked_by_its_number_without_a_feed_key_or_through_otp() -
     ],
 )
 def test_the_setting_names_its_series_in_order_each_once(value: Any, series: Any) -> None:
-    assert oebb_stop_series(value) == series
+    assert series_setting(value) == series
 
 
 def test_the_feeds_of_a_session_by_motis_dataset_and_otp_feed_id() -> None:
@@ -524,6 +587,27 @@ async def test_a_db_point_and_oebb_s_number_of_one_station_get_the_same_station(
     assert sorted(module.calls) == [
         (CODE, SERIES, ["8103000"]),
         (STOP, DB_FEED, ["DE::ScheduledStopPoint:8103000_DBDB_9::"]),
+    ]
+
+
+async def test_a_dhid_named_db_stop_and_oebb_s_number_get_the_same_station(
+    module: Module,
+) -> None:
+    """München Hbf: VIATOR's DB stop `de:09162:100` (no parent, not in the feed's extract) and
+    ÖBB's number 8000261 (DELFI_stop_key) are one station of the module."""
+    module.stations[(CODE, "IFOPT_DHID", "de:09162:100")] = [("ZZ-99007", None)]
+    module.stations[(CODE, SERIES, "8000261")] = [("ZZ-99007", None)]
+
+    placed = await ModuleStationResolver(FEEDS, BOTH, IFOPT).resolve(
+        [motis_stop("db_de:09162:100"), *_numbers("8000261")]
+    )
+
+    assert set(placed.values()) == {ResolvedStation(station_id="ZZ-99007")}
+    assert len(placed) == 2
+    assert sorted(module.calls) == [
+        (CODE, SERIES, ["8000261"]),
+        (CODE, "IFOPT_DHID", ["de:09162:100"]),
+        (STOP, DB_FEED, ["de:09162:100"]),
     ]
 
 

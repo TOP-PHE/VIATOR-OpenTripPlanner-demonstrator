@@ -238,8 +238,8 @@ def test_a_failed_resolver_step_is_given_up(monkeypatch: pytest.MonkeyPatch) -> 
 def test_each_session_s_resolver_is_built_from_its_feeds(monkeypatch: pytest.MonkeyPatch) -> None:
     built: list[tuple[Any, ...]] = []
 
-    def resolver_for_session(config: Any, uploads: Any, series: Any) -> str:
-        built.append((config, uploads, series))
+    def resolver_for_session(config: Any, uploads: Any, series: Any, ifopt: Any) -> str:
+        built.append((config, uploads, series, ifopt))
         return f"resolver of {config.get('name')}"
 
     # The upload sender's module needs `fcntl`: a stand-in, on every platform.
@@ -257,11 +257,19 @@ def test_each_session_s_resolver_is_built_from_its_feeds(monkeypatch: pytest.Mon
     resolvers, oebb = api._station_resolvers(
         MagicMock(),
         sessions,
-        {"COVERAGE_OEBB_STOP_SERIES": "DELFI_stop_key, Trainline_EVA"},  # type: ignore[arg-type]
+        {
+            "COVERAGE_OEBB_STOP_SERIES": "DELFI_stop_key, Trainline_EVA",
+            "COVERAGE_IFOPT_STOP_SERIES": "IFOPT_DHID",
+        },  # type: ignore[arg-type]
     )
 
     assert resolvers == {"s1": "resolver of one", "s2": "resolver of None"}
-    assert built[0] == ({"name": "one"}, {"p": "sha of s1"}, ("DELFI_stop_key", "Trainline_EVA"))
+    assert built[0] == (
+        {"name": "one"},
+        {"p": "sha of s1"},
+        ("DELFI_stop_key", "Trainline_EVA"),
+        ("IFOPT_DHID",),
+    )
     assert built[1][0] == {}
     assert isinstance(oebb, api.station_resolver.ModuleStationResolver)
 

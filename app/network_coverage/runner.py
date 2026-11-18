@@ -2041,16 +2041,18 @@ class _SweepStations:
 
     def __init__(self, db: DbSession, run: NetworkCoverageRun) -> None:
         from .. import station_module
-        from ..journey.station_resolver import oebb_stop_series
+        from ..journey.station_resolver import series_setting
 
         self._db = db
         self._run_session = run.session_id
         self._enabled = station_module.enabled()
         self._series: tuple[str, ...] = ()
+        self._ifopt: tuple[str, ...] = ()
         self._resolvers: dict[str | None, Any] = {}
         if self._enabled:
-            series = config_service.get_all(db).get("COVERAGE_OEBB_STOP_SERIES")
-            self._series = oebb_stop_series(series)
+            cfg = config_service.get_all(db)
+            self._series = series_setting(cfg.get("COVERAGE_OEBB_STOP_SERIES"))
+            self._ifopt = series_setting(cfg.get("COVERAGE_IFOPT_STOP_SERIES"))
 
     def _resolver(self, session_id: str | None) -> Any:
         from ..journey.station_resolver import (
@@ -2062,13 +2064,16 @@ class _SweepStations:
         if session_id not in self._resolvers:
             row = self._db.get(SessionRow, session_id) if session_id else None
             if row is None or not session_id:
-                resolver = ModuleStationResolver(SessionFeeds({}, {}), self._series)
+                resolver = ModuleStationResolver(SessionFeeds({}, {}), self._series, self._ifopt)
             else:
                 # The upload sender's module: it imports the extractor, which needs `fcntl`.
                 from ..station_extract_upload import latest_upload_sha256
 
                 resolver = resolver_for_session(
-                    row.config or {}, latest_upload_sha256(self._db, session_id), self._series
+                    row.config or {},
+                    latest_upload_sha256(self._db, session_id),
+                    self._series,
+                    self._ifopt,
                 )
             self._resolvers[session_id] = resolver
         return self._resolvers[session_id]
