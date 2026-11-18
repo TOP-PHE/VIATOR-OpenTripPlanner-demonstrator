@@ -218,7 +218,9 @@ def test_a_session_unknown_to_the_database_gets_a_resolver_for_oebb_s_stops_only
 ) -> None:
     monkeypatch.setattr(station_module, "enabled", lambda: True)
     monkeypatch.setattr(
-        config_service, "get_all", lambda _db, **_kw: {"COVERAGE_OEBB_STOP_SERIES": "zz"}
+        config_service,
+        "get_all",
+        lambda _db, **_kw: {"COVERAGE_OEBB_STOP_SERIES": "zz", "COVERAGE_IFOPT_STOP_SERIES": "yy"},
     )
     db = MagicMock()
     db.get.return_value = None
@@ -228,4 +230,5 @@ def test_a_session_unknown_to_the_database_gets_a_resolver_for_oebb_s_stops_only
 
     assert resolver._feeds.motis == {}
     assert resolver._oebb_series == ("zz",)
+    assert resolver._ifopt_series == ("yy",)
     assert stations._resolver("gone") is resolver  # built once

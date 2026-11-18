@@ -79,7 +79,7 @@ from ...config_schema import CONFIG_SCHEMA
 from ...db import get_db
 from ...db_steps import db_step
 from ...journey.canonical import CanonicalJourney
-from ...journey.station_resolver import oebb_stop_series
+from ...journey.station_resolver import series_setting
 from ...models import (
     JourneySearchExecution,
     JourneyTrip,
@@ -3561,7 +3561,7 @@ _oebb_stop_cache: dict[tuple[str | None, str], tuple[float, OebbStopStation | No
 def _oebb_stop_series(db: DbSession) -> tuple[str, ...]:
     """The series the module files ÖBB's stop numbers under, in the order
     they are asked; none when the setting is empty."""
-    return oebb_stop_series(config_service.get_all(db).get("COVERAGE_OEBB_STOP_SERIES"))
+    return series_setting(config_service.get_all(db).get("COVERAGE_OEBB_STOP_SERIES"))
 
 
 def _cached_oebb_stop(

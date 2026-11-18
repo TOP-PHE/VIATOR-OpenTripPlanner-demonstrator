@@ -2735,10 +2735,18 @@ a pair changed, so **scores of runs before and after are not comparable**: run a
   Austrian and German pairs included, as run f7165bd7 already did on 12 Nov. Such a stop is now
   also asked by that number, in the series of `COVERAGE_OEBB_STOP_SERIES` (ÖBB's numbers are
   EVA numbers too), after the feed's own key; the ÖBB side gets the same station, so the leg is
-  compared by station id. FlixTrain's points (`…:10343_FX_::`) and the stops DB names by a DHID
-  (`de:09162:100`) carry no EVA number and stay unplaced: a link from each ScheduledStopPoint to
-  its StopPlace in the extract, or the module taking those ids, would place them. Runs before
-  are not comparable on this point.
+  compared by station id. FlixTrain's points (`…:10343_FX_::`) carry no EVA number and stay
+  unplaced. Runs before are not comparable on this point.
+- **DB's German stops are placed by their DHID** (since 2026-11-18). DB's NeTEx names its German
+  stations by DHID (`de:09162:100`, München Hbf), with no parent and outside the feed's
+  extract: run 09d13313 (18 Nov) placed the Austrian stations of the `db` feed with the EVA
+  number above and still no German one (Germany–Germany: "could not be compared" 2 802 times
+  in 156 cells, as before). A MOTIS or OTP stop whose id, or its parent's, starts with a German
+  DHID (`de:<AGS>:<n>`, a quay `de:09162:100:3:5` included) is now also asked by its station's
+  DHID (the first three segments) in the series of **`COVERAGE_IFOPT_STOP_SERIES`** (Admin →
+  Configuration → Network coverage matrix; default `IFOPT_DHID`, names separated by commas,
+  empty = not asked). The module files there the DHID its master gives each station
+  (`ifopt_dhid`); a module without that series answers no station, and nothing fails.
 - **ÖBB's stop number is not a UIC code** (since 2026-11-12). ÖBB numbers a stop with its own
   EVA number (`extId`). It counts as the station's UIC code only where ÖBB states that same
   number as the UIC in its `gidL` (Zürich HB 8503000); elsewhere it is not one (Paris Gare de
