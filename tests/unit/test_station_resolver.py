@@ -127,6 +127,57 @@ def test_an_oebb_stop_is_asked_in_each_series_in_their_order() -> None:
     assert keys_of(stop, FEEDS, BOTH) == [(CODE, SERIES, "8700012"), (CODE, FALLBACK, "8700012")]
 
 
+# ── DB's ScheduledStopPoints, by their station's EVA number (run 4ecb4710, 18 Nov) ──────────
+
+
+@pytest.mark.parametrize(
+    ("ref", "number"),
+    [
+        pytest.param("db_DE::ScheduledStopPoint:8100002_DBDB_::", "8100002", id="Salzburg Hbf"),
+        pytest.param("db_DE::ScheduledStopPoint:8103000_DBDB_9::", "8103000", id="Wien Hbf"),
+    ],
+)
+def test_a_db_point_is_asked_by_its_feed_then_by_its_eva_number(ref: str, number: str) -> None:
+    stop = motis_stop(ref)
+
+    assert keys_of(stop, FEEDS, BOTH) == [
+        (STOP, DB_FEED, ref.removeprefix("db_")),
+        (CODE, SERIES, number),
+        (CODE, FALLBACK, number),
+    ]
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        pytest.param("db_DE::ScheduledStopPoint:10343_FX_::", id="FlixTrain: no EVA number"),
+        pytest.param("db_de:09162:100", id="a DHID"),
+        pytest.param("db_DE::ScheduledStopPoint:81000020_DBDB_::", id="eight digits"),
+        pytest.param("db_DE::StopPlace:8100002_DBDB_::", id="a StopPlace"),
+        pytest.param("db_XDE::ScheduledStopPoint:8100002_DBDB_::", id="not at the start"),
+    ],
+)
+def test_other_db_stops_get_no_eva_number(ref: str) -> None:
+    assert keys_of(motis_stop(ref), FEEDS, BOTH) == [(STOP, DB_FEED, ref.removeprefix("db_"))]
+
+
+def test_a_db_point_is_asked_by_its_number_without_a_feed_key_or_through_otp() -> None:
+    unknown_feed = CanonicalStopPlace(
+        ref="zz_DE::ScheduledStopPoint:8100002_DBDB_::", source="motis:zz"
+    )
+    otp = CanonicalStopPlace(
+        ref="FR-SNCF:DE::ScheduledStopPoint:8100002_DBDB_::", source="otp:FR-SNCF"
+    )
+
+    assert keys_of(unknown_feed, FEEDS, ONE) == [(CODE, SERIES, "8100002")]
+    assert keys_of(otp, FEEDS, ONE) == [
+        (STOP, OTP_FEED, "DE::ScheduledStopPoint:8100002_DBDB_::"),
+        (CODE, SERIES, "8100002"),
+    ]
+    # Without a series, only the feed's keys.
+    assert keys_of(otp, FEEDS, ()) == [(STOP, OTP_FEED, "DE::ScheduledStopPoint:8100002_DBDB_::")]
+
+
 @pytest.mark.parametrize(
     ("value", "series"),
     [
@@ -450,3 +501,37 @@ async def test_a_failure_in_the_first_series_asks_no_other(module: Module) -> No
 
     assert await ModuleStationResolver(FEEDS, BOTH).resolve(_numbers("8700012")) == {}
     assert module.calls == [(CODE, SERIES, ["8700012"])]
+
+
+async def test_a_db_point_and_oebb_s_number_of_one_station_get_the_same_station(
+    module: Module,
+) -> None:
+    """Innsbruck Hbf → Wien Hbf of run 4ecb4710: VIATOR's train is in DB's feed, whose points
+    the module does not hold; ÖBB's number 8103000 is in DELFI_stop_key. Before, VIATOR's end had
+    no station and the leg was compared by position."""
+    module.stations[(CODE, SERIES, "8103000")] = [("ZZ-99003", None)]
+    db_point = motis_stop("db_DE::ScheduledStopPoint:8103000_DBDB_9::")
+
+    placed = await ModuleStationResolver(FEEDS, BOTH).resolve([db_point, *_numbers("8103000")])
+
+    assert placed == {
+        ("motis:db", "db_DE::ScheduledStopPoint:8103000_DBDB_9::"): ResolvedStation(
+            station_id="ZZ-99003"
+        ),
+        ("hafas:oebb", "A=1@L=8103000@"): ResolvedStation(station_id="ZZ-99003"),
+    }
+    # The feed's key and the number in the first series together, the number asked once.
+    assert sorted(module.calls) == [
+        (CODE, SERIES, ["8103000"]),
+        (STOP, DB_FEED, ["DE::ScheduledStopPoint:8103000_DBDB_9::"]),
+    ]
+
+
+async def test_the_feed_s_own_station_comes_before_the_eva_number(module: Module) -> None:
+    point = "DE::ScheduledStopPoint:8100002_DBDB_::"
+    module.stations[(STOP, DB_FEED, point)] = [("ZZ-99001", None)]
+    module.stations[(CODE, SERIES, "8100002")] = [("ZZ-99002", None)]
+
+    placed = await ModuleStationResolver(FEEDS, BOTH).resolve([motis_stop(f"db_{point}")])
+
+    assert placed == {("motis:db", f"db_{point}"): ResolvedStation(station_id="ZZ-99001")}
