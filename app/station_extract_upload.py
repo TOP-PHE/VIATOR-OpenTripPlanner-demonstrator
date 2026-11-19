@@ -1212,11 +1212,14 @@ def send_session_extracts(
     ready: Callable[[str, Feed], bool] = _ready,
     observer: PassObserver | None = None,
     patience: Patience | None = None,
+    extractor_version: str | None = None,
 ) -> PassResult:
     """Send what the module lacks of a session's feeds, within `budget` seconds,
     in the order of `_send_order` (`ready` says which need no extraction),
     each call waiting for the module as `patience` allows.
     `observer`, when given, is told the pass's start, each feed and the end.
+    `extractor_version`: the version the `HEAD` asks about, by default the
+    extractor's (`station_extract.EXTRACTOR_VERSION`).
 
     Never raises an `Exception`: an unexpected one ends the pass (`error`,
     one WARNING). The caller goes on whatever the result (a graph is built,
@@ -1238,7 +1241,7 @@ def send_session_extracts(
             budget,
             should_stop,
             extract,
-            station_extract.EXTRACTOR_VERSION,
+            extractor_version or station_extract.EXTRACTOR_VERSION,
             sid,
             cache_only,
             patience,
@@ -1339,6 +1342,44 @@ def send_session(
             cache_only=cache_only,
             observer=observer,
             patience=patience,
+        )
+
+
+def send_listed_feed(
+    made: Any,
+    *,
+    provider_id: str,
+    budget: float,
+    patience: Patience | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+    clock: Clock | None = None,
+) -> PassResult:
+    """Send one extract made from no archive (`station_extract.write_listed_extract`: the HAFAS
+    stop list, `app/hafas_stop_list.py`), by the same two calls and rules as a session's feeds:
+    the `HEAD` of its feed key, version and extractor version, then the `PUT` of the file when
+    the module lacks it. No session: no `X-Viator-Session-Id`, no outcome kept in a session's
+    folder (the caller logs it). One pass at a time in the process, as `send_session`. Never
+    raises an `Exception`."""
+    feed = Feed(
+        provider_id=provider_id,
+        provider_cfg={},
+        feed_key=made.feed_key,
+        # The extract is all there is of the feed: its file stands for the archive.
+        archive=Path(made.path_gz),
+        archive_sha256=made.feed_version,
+    )
+    with _one_at_a_time:
+        return send_session_extracts(
+            "",
+            [feed],
+            budget=budget,
+            clock=clock,
+            transport=transport,
+            extract=lambda *_: made,
+            record=False,
+            ready=lambda *_: True,
+            patience=patience,
+            extractor_version=made.extractor_version,
         )
 
 

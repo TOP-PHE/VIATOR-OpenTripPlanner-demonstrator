@@ -460,8 +460,9 @@ def _station_resolvers(
     db: DbSession, sessions: list[SessionRow], cfg: dict[str, Any]
 ) -> tuple[dict[str, StationResolver], StationResolver]:
     """(DB step) The station resolver of each fanout session (its feeds and uploads) and the
-    one of ÖBB's numbers (`COVERAGE_OEBB_STOP_SERIES`, the series the coverage check uses, in
-    their order); DHID-named stops in the series of `COVERAGE_IFOPT_STOP_SERIES`."""
+    one of ÖBB's numbers (ÖBB's stop list, then `COVERAGE_OEBB_STOP_SERIES`, the series the
+    coverage check uses, in their order); DHID-named stops in the series of
+    `COVERAGE_IFOPT_STOP_SERIES`."""
     # The upload sender's module imports the extractor, which needs `fcntl`: imported here.
     from ..station_extract_upload import latest_upload_sha256
 
@@ -471,10 +472,17 @@ def _station_resolvers(
     for session in sessions:
         sid = session.id
         resolvers[sid] = station_resolver.resolver_for_session(
-            session.config or {}, latest_upload_sha256(db, sid), series, ifopt
+            session.config or {},
+            latest_upload_sha256(db, sid),
+            series,
+            ifopt_series=ifopt,
+            oebb_stop_list=station_resolver.OEBB_STOP_LIST,
         )
     return resolvers, station_resolver.ModuleStationResolver(
-        station_resolver.SessionFeeds({}, {}), series, ifopt
+        station_resolver.SessionFeeds({}, {}),
+        series,
+        ifopt_series=ifopt,
+        oebb_stop_list=station_resolver.OEBB_STOP_LIST,
     )
 
 

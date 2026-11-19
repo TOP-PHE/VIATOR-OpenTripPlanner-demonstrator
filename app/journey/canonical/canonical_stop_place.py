@@ -32,7 +32,8 @@ class CanonicalStopPlace(BaseModel):
     source: str = Field(min_length=1)
     name: str | None = None
     uic: str | None = Field(default=None, pattern=r"^[0-9]{7}$")
-    # Codes by series (`GTFS_STOP_CODE`, `OEBB_EXT`, `SLOID`): the evidence a resolution needs.
+    # Codes by series (`GTFS_STOP_CODE`, `OEBB_EXT`, `HAFAS_UIC`, `SLOID`): the evidence a
+    # resolution needs.
     codes: dict[str, str] = Field(default_factory=dict)
     parent_ref: str | None = None
     # `OEBB:<payload>`: an ÖBB station we could not place in the UIC namespace. Kept apart so

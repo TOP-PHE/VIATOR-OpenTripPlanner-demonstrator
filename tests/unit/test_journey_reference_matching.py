@@ -238,8 +238,10 @@ def test_a_failed_resolver_step_is_given_up(monkeypatch: pytest.MonkeyPatch) -> 
 def test_each_session_s_resolver_is_built_from_its_feeds(monkeypatch: pytest.MonkeyPatch) -> None:
     built: list[tuple[Any, ...]] = []
 
-    def resolver_for_session(config: Any, uploads: Any, series: Any, ifopt: Any) -> str:
-        built.append((config, uploads, series, ifopt))
+    def resolver_for_session(
+        config: Any, uploads: Any, series: Any, *, ifopt_series: Any, oebb_stop_list: Any
+    ) -> str:
+        built.append((config, uploads, series, ifopt_series, oebb_stop_list))
         return f"resolver of {config.get('name')}"
 
     # The upload sender's module needs `fcntl`: a stand-in, on every platform.
@@ -264,14 +266,18 @@ def test_each_session_s_resolver_is_built_from_its_feeds(monkeypatch: pytest.Mon
     )
 
     assert resolvers == {"s1": "resolver of one", "s2": "resolver of None"}
+    stop_list = api.station_resolver.OEBB_STOP_LIST
     assert built[0] == (
         {"name": "one"},
         {"p": "sha of s1"},
         ("DELFI_stop_key", "Trainline_EVA"),
         ("IFOPT_DHID",),
+        stop_list,
     )
     assert built[1][0] == {}
     assert isinstance(oebb, api.station_resolver.ModuleStationResolver)
+    # ÖBB's numbers: its stop list first, then the series (the module's 22.20).
+    assert oebb._oebb_stop_list == stop_list
 
 
 # ── What the page receives ────────────────────────────────────────────────────────────────

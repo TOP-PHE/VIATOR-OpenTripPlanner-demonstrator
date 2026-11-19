@@ -2034,7 +2034,8 @@ def _persist_alignment_on_row(
 class _SweepStations:
     """The stations of a check's journeys (#304, design D8): a station resolver per VIATOR
     session (`station_resolver.resolver_for_session`, built once, from the session's providers
-    and uploads) and ÖBB's numbers in the series of `COVERAGE_OEBB_STOP_SERIES`, in their order.
+    and uploads) and ÖBB's numbers in ÖBB's stop list (`station_resolver.OEBB_STOP_LIST`, the
+    module's 22.20), then in the series of `COVERAGE_OEBB_STOP_SERIES`, in their order.
     A journey is resolved by the resolver of its own session (a fanout run mixes them), else the
     run's. Off when the station module is not configured. Never fails a cell: a failure leaves the stops unplaced, and the
     matching then falls back to codes and positions."""
@@ -2056,6 +2057,7 @@ class _SweepStations:
 
     def _resolver(self, session_id: str | None) -> Any:
         from ..journey.station_resolver import (
+            OEBB_STOP_LIST,
             ModuleStationResolver,
             SessionFeeds,
             resolver_for_session,
@@ -2064,7 +2066,12 @@ class _SweepStations:
         if session_id not in self._resolvers:
             row = self._db.get(SessionRow, session_id) if session_id else None
             if row is None or not session_id:
-                resolver = ModuleStationResolver(SessionFeeds({}, {}), self._series, self._ifopt)
+                resolver = ModuleStationResolver(
+                    SessionFeeds({}, {}),
+                    self._series,
+                    ifopt_series=self._ifopt,
+                    oebb_stop_list=OEBB_STOP_LIST,
+                )
             else:
                 # The upload sender's module: it imports the extractor, which needs `fcntl`.
                 from ..station_extract_upload import latest_upload_sha256
@@ -2073,7 +2080,8 @@ class _SweepStations:
                     row.config or {},
                     latest_upload_sha256(self._db, session_id),
                     self._series,
-                    self._ifopt,
+                    ifopt_series=self._ifopt,
+                    oebb_stop_list=OEBB_STOP_LIST,
                 )
             self._resolvers[session_id] = resolver
         return self._resolvers[session_id]

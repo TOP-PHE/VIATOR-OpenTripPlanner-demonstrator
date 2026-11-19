@@ -12,6 +12,7 @@ from .base import Base
 from .config import PlatformConfig
 from .credentials import UserCredential
 from .graph import GraphSnapshot
+from .hafas_places import HafasPlace, HafasPlaceRun
 from .identity import PasswordResetToken, User, UserRole, VerificationToken
 from .ingestion import RebuildJob, Upload
 from .master import (
@@ -35,6 +36,8 @@ __all__ = [
     "AuditEvent",
     "Base",
     "GraphSnapshot",
+    "HafasPlace",
+    "HafasPlaceRun",
     "JourneySearch",
     "JourneySearchExecution",
     "JourneyTrip",
