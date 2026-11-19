@@ -15,6 +15,12 @@ Nothing compares `station_id` yet: the matching engine of #304 will (its design 
     `parent_station`, a NeTEx root `StopPlace`), so the stop's parent (`parentId`) is asked
     first, then the stop itself (a stop without a parent is its own station);
   * an OTP stop (`otp:<feed>`, `<feed>:<local>`): the provider of that id, the stop itself;
+  * a MOTIS or OTP stop that is one of DB's ScheduledStopPoints named by a station's EVA number
+    (`DE::ScheduledStopPoint:8100002_DBDB_::`, Salzburg Hbf, in eu19's `db` feed): after the
+    keys above, that number, as an ÖBB stop's (`_db_eva`). MOTIS gives such a stop no parent and
+    the feed's extract holds its StopPlaces only (`DE::StopPlace:…`), so its own key places it
+    nowhere: measured 18 Nov on run 4ecb4710, every DB stop of a journey was unplaced and its
+    legs compared by position;
   * an ÖBB HAFAS stop (`hafas:oebb`): its number (`extId`, else the number of its `UIC:` or
     `OEBB:` token, as the coverage cell modal asks it), first as a stop of ÖBB's stop list
     (`OEBB_STOP_LIST`, the feed `hafas:…` of the places ÖBB's planner answered, which VIATOR
@@ -24,7 +30,14 @@ Nothing compares `station_id` yet: the matching engine of #304 will (its design 
     22.19, for the numbers outside Germany and Austria); each is asked only for the numbers the
     one before it places nowhere (the module's decision 72), so a key of several stations is
     never settled by the next. The stop list is asked only when a series is set (an empty
-    setting leaves ÖBB's stops out) and when the resolver is given it (`oebb_stop_list`);
+    setting leaves ÖBB's stops out) and when the resolver is given it (`oebb_stop_list`).
+    ÖBB's numbers are EVA numbers, DB's numbering: the same series serve DB's stops;
+  * a MOTIS or OTP stop whose id (its parent's first) is a German DHID (`de:09162:100`, München
+    Hbf; `de:09162:100:3:5`, one of its quays): after the keys above, its station's DHID (the
+    first three segments) in the series of `COVERAGE_IFOPT_STOP_SERIES` (`_dhid`). DB's NeTEx
+    names its German stations so, with no parent: measured 18 Nov on run 09d13313, #461 placed
+    the Austrian stations of the `db` feed (EVA-named) and none of the German ones. The module
+    files a station's DHID (`StationRef.ifopt_dhid`) as a code of that series;
   * anything else (an OJP stop, a provider with no feed key: a derived feed, an upload whose
     file is unknown): not asked.
 
@@ -43,6 +56,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -91,10 +105,11 @@ class Unplaced(Enum):
 Answer = ResolvedStation | Unplaced
 
 
-def oebb_stop_series(value: object) -> tuple[str, ...]:
-    """The code series of `COVERAGE_OEBB_STOP_SERIES`, in the order they are asked: its names
-    separated by commas, trimmed, each once (`"DELFI_stop_key,Trainline_EVA"`; one name alone
-    is one series). None for an empty setting: ÖBB's stops are then left out."""
+def series_setting(value: object) -> tuple[str, ...]:
+    """The code series of a setting that names some (`COVERAGE_OEBB_STOP_SERIES`,
+    `COVERAGE_IFOPT_STOP_SERIES`), in the order they are asked: its names separated by commas,
+    trimmed, each once (`"DELFI_stop_key,Trainline_EVA"`; one name alone is one series). None
+    for an empty setting: the stops it serves are then not asked by a code."""
     if not isinstance(value, str):
         return ()
     return tuple(dict.fromkeys(name.strip() for name in value.split(",") if name.strip()))
@@ -190,15 +205,45 @@ def _token_number(token: str | None) -> str | None:
     return token.split(":", 1)[1] or None
 
 
-def keys_of(
-    stop: CanonicalStopPlace,
-    feeds: SessionFeeds,
-    oebb_series: tuple[str, ...],
-    oebb_stop_list: str | None = None,
-) -> list[ModuleKey]:
-    """The keys `stop` is asked by, the one to trust first first; none when the module cannot
-    know it. An ÖBB stop's are its number as a stop of `oebb_stop_list` (when given), then in
-    each series of `oebb_series`, in their order."""
+# One of DB's ScheduledStopPoints named by its station's EVA number, at the start of a stop's
+# local id (after MOTIS's `<dataset>_` or OTP's `<feed>:`): `DE::ScheduledStopPoint:8100002_DBDB_::`
+# (Salzburg Hbf), `…:8103000_DBDB_9::` (Wien Hbf). FlixTrain's (`…:10343_FX_::`) carry no EVA number.
+_DB_EVA_POINT = re.compile(r"(?:\A|[_:])DE::ScheduledStopPoint:(\d{7})_DBDB_")
+
+
+def _db_eva(ref: str) -> str | None:
+    """The EVA number of a stop that is one of DB's ScheduledStopPoints, or None."""
+    found = _DB_EVA_POINT.search(ref)
+    return found.group(1) if found else None
+
+
+# A German DHID at the start of a stop's local id: a station's (`de:<AGS>:<n>`, München Hbf
+# `de:09162:100`) or one of its areas or quays (`de:09162:100:3:5`), whose station is the first
+# three segments.
+_DHID = re.compile(r"\A(de:\d{5}:\d+)(?::|\Z)")
+
+
+def _dhid(stop: CanonicalStopPlace) -> str | None:
+    """The station-level DHID of a MOTIS or OTP stop, its parent's id first, or None."""
+    if stop.source.startswith(MOTIS_PREFIX):
+        feed, separator = stop.source[len(MOTIS_PREFIX) :], "_"
+    else:
+        feed, separator = stop.source[len(OTP_PREFIX) :], ":"
+    for ref in (stop.parent_ref, stop.ref):
+        local = _local(ref, feed, separator)
+        found = _DHID.match(local) if local is not None else None
+        if found:
+            return found.group(1)
+    return None
+
+
+def _code_keys(code: str | None, series: tuple[str, ...]) -> list[ModuleKey]:
+    return [] if code is None else [(CODE, one, code) for one in series]
+
+
+def _feed_keys(stop: CanonicalStopPlace, feeds: SessionFeeds) -> list[ModuleKey]:
+    """A MOTIS or OTP stop's keys in its feed: the parent's then its own for MOTIS, its own for
+    OTP; none when the feed has no key."""
     if stop.source.startswith(MOTIS_PREFIX):
         dataset = stop.source[len(MOTIS_PREFIX) :]
         feed = feeds.motis.get(dataset)
@@ -206,11 +251,32 @@ def keys_of(
             return []
         locals_ = (_local(stop.parent_ref, dataset, "_"), _local(stop.ref, dataset, "_"))
         return [(STOP, feed, local) for local in dict.fromkeys(locals_) if local is not None]
-    if stop.source.startswith(OTP_PREFIX):
-        feed_id = stop.source[len(OTP_PREFIX) :]
-        feed = feeds.otp.get(feed_id)
-        local = _local(stop.ref, feed_id, ":") if feed is not None else None
-        return [] if feed is None or local is None else [(STOP, feed, local)]
+    feed_id = stop.source[len(OTP_PREFIX) :]
+    feed = feeds.otp.get(feed_id)
+    local = _local(stop.ref, feed_id, ":") if feed is not None else None
+    return [] if feed is None or local is None else [(STOP, feed, local)]
+
+
+def keys_of(
+    stop: CanonicalStopPlace,
+    feeds: SessionFeeds,
+    oebb_series: tuple[str, ...],
+    *,
+    ifopt_series: tuple[str, ...] = (),
+    oebb_stop_list: str | None = None,
+) -> list[ModuleKey]:
+    """The keys `stop` is asked by, the one to trust first first; none when the module cannot
+    know it. `oebb_series` are the series of EVA numbers, in their order: an ÖBB stop is asked
+    by its number as a stop of `oebb_stop_list` (when given), then in each; a MOTIS or OTP stop
+    by its feed's keys, then, when it is one of DB's ScheduledStopPoints, by its station's EVA
+    number in each, and when it is named by a German DHID, by its station's DHID in each series
+    of `ifopt_series`."""
+    if stop.source.startswith((MOTIS_PREFIX, OTP_PREFIX)):
+        return (
+            _feed_keys(stop, feeds)
+            + _code_keys(_db_eva(stop.ref), oebb_series)
+            + _code_keys(_dhid(stop), ifopt_series)
+        )
     if stop.source == OEBB_SOURCE and oebb_series:
         return _oebb_keys(stop, oebb_series, oebb_stop_list)
     return []
@@ -313,13 +379,15 @@ def resolver_for_session(
     config: Mapping[str, Any],
     upload_sha256: Mapping[str, str],
     oebb_series: tuple[str, ...],
+    *,
+    ifopt_series: tuple[str, ...] = (),
     oebb_stop_list: str | None = None,
 ) -> ModuleStationResolver:
     """The resolver of a session's journeys: its `config` (`sessions.config`), the sha256 of
     the latest file uploaded for each provider (`station_extract_upload.latest_upload_sha256`),
-    ÖBB's stop list (`OEBB_STOP_LIST`, or None) and the code series of ÖBB's numbers, in their
-    order (`oebb_stop_series`). A configuration that does not read gives a resolver that places
-    only ÖBB's stops."""
+    the code series of EVA numbers and those of DHIDs, each in their order (`series_setting`),
+    and ÖBB's stop list (`OEBB_STOP_LIST`, or None). A configuration that does not read gives a
+    resolver that places only ÖBB's stops."""
     from .. import ingestion, station_extract
 
     try:
@@ -332,23 +400,31 @@ def resolver_for_session(
             provider, upload_sha256=upload_sha256.get(str(provider.get("id")))
         )
 
-    return ModuleStationResolver(session_feeds(providers, key_of), oebb_series, oebb_stop_list)
+    return ModuleStationResolver(
+        session_feeds(providers, key_of),
+        oebb_series,
+        ifopt_series=ifopt_series,
+        oebb_stop_list=oebb_stop_list,
+    )
 
 
 class ModuleStationResolver:
     """The `StationResolver` of one session's journeys (its feeds) and of ÖBB's: its stop list
     first (`oebb_stop_list`, `OEBB_STOP_LIST`; None to leave it out), then the code series of
-    `COVERAGE_OEBB_STOP_SERIES`, in their order (`oebb_stop_series`; none to leave ÖBB's stops
-    out)."""
+    `COVERAGE_OEBB_STOP_SERIES`, in their order (`series_setting`; none to leave ÖBB's stops
+    out); DHID-named stops asked in those of `COVERAGE_IFOPT_STOP_SERIES`."""
 
     def __init__(
         self,
         feeds: SessionFeeds,
         oebb_series: tuple[str, ...],
+        *,
+        ifopt_series: tuple[str, ...] = (),
         oebb_stop_list: str | None = None,
     ) -> None:
         self._feeds = feeds
         self._oebb_series = oebb_series
+        self._ifopt_series = ifopt_series
         self._oebb_stop_list = oebb_stop_list
 
     async def resolve(
@@ -356,11 +432,16 @@ class ModuleStationResolver:
     ) -> Mapping[StopKey, ResolvedStation]:
         """The stations of the stops the module places; a stop it does not is absent. Asked in
         rounds: the answers kept are read first, then each round asks the keys still needed (a
-        feed's stops at once, ÖBB's numbers in its stop list, then one series a round, only those
-        the one before placed nowhere), until every stop is settled or a call fails."""
+        feed's stops at once, ÖBB's numbers in its stop list, then EVA numbers one series a
+        round, only those the one before placed nowhere), until every stop is settled or a call
+        fails."""
         wanted = {
             (stop.source, stop.ref): keys_of(
-                stop, self._feeds, self._oebb_series, self._oebb_stop_list
+                stop,
+                self._feeds,
+                self._oebb_series,
+                ifopt_series=self._ifopt_series,
+                oebb_stop_list=self._oebb_stop_list,
             )
             for stop in stops
         }
