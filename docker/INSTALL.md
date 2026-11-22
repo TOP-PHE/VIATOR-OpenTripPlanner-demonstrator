@@ -124,6 +124,8 @@ OTP_BUILD_PHASES=two_phase  # 'one_shot' available as fallback (debug only)
 DOCKER_GID=<verify on host> # see note below — not always 999
 ```
 
+> **`JWT_SECRET` must be your own.** Whoever knows it can sign a session for any role. Web refuses to start while it is the placeholder of `.env.example`, or shorter than 32 bytes: the container exits and the last line of `docker compose logs web` says `JWT_SECRET is still a placeholder…` or `JWT_SECRET is shorter than 32 bytes…`.
+
 > **`DOCKER_GID` matters.** The worker container runs as a non-root user that needs read access to `/var/run/docker.sock` (it spawns per-session OTP containers). The host's `docker` group GID is distribution-dependent — don't trust the `999` default in `.env.example`. Verify on the host first:
 > ```bash
 > getent group docker | cut -d: -f3

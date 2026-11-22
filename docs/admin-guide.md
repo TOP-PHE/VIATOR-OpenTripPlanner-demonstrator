@@ -741,12 +741,24 @@ docker compose -p viator logs -f web worker nginx postgres
 curl -s https://your-host/healthz             # web reachable
 curl -s https://your-host/healthz/version     # version baked in
 curl -s https://your-host/api/readyz          # web + DB ready
-curl -s https://your-host/otp/<sid>/actuators/health  # per-session OTP
+# per-session OTP, asked inside its container (see the note below)
+docker compose -p viator exec otp-<sid> curl -fsS http://localhost:8080/otp/actuators/health
 
 # Disk usage (the easiest thing to neglect)
 df -h /var/lib/docker
 sudo du -sh /var/lib/docker/volumes/viator_*
 ```
+
+**The planners' public paths need a signed-in session.** `/otp/<sid>/` and
+`/motis/<sid>/` are served to signed-in users only, whatever their role: OTP
+and MOTIS have no authentication of their own, so nginx asks web first
+(`auth_request` on `/api/auth/proxy-validate`, as for `/grafana/` and
+`/prometheus/`). A request without a valid session is sent to `/login`. From
+a terminal, either ask the planner inside its container, as above, or send
+your session: `-b "viator_jwt=$VIATOR_JWT"`, where `VIATOR_JWT` holds the
+value of your browser's `viator_jwt` cookie. The journey API and the coverage
+runs are not concerned: web and the worker reach the planners inside the
+Docker network, not through nginx.
 
 #### Structured JSON logs (v0.1.32.9+)
 
@@ -1640,8 +1652,10 @@ otp_api_timeout + 2 000 ms` (the +2 000 covers connection + transit).
 **Step 2 — diagnose by direct OTP query** to bypass the fanout layer:
 
 ```bash
-# Substitute your actual coordinates (search a station on /admin/master/stations)
+# Substitute your actual coordinates (search a station on /admin/master/stations).
+# VIATOR_JWT: the value of your browser's `viator_jwt` cookie (§5.4).
 curl -s "https://vmi3259514.contaboserver.net/otp/nap-fr-rail/otp/gtfs/v1" \
+  -b "viator_jwt=$VIATOR_JWT" \
   -H "Content-Type: application/json" \
   -d '{"query":"{plan(from:{lat:48.8443,lon:2.3739} to:{lat:43.3026,lon:5.3801} date:\"2026-05-19\" time:\"07:39\" numItineraries:5){itineraries{startTime endTime legs{mode startTime endTime}}}}"}' \
   | head -50

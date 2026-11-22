@@ -50,7 +50,7 @@ from .middleware.request_id import RequestIdMiddleware
 from .models import RebuildJob, Upload
 from .rate_limit import limiter
 from .security import authed, authed_or_none
-from .settings import settings
+from .settings import jwt_secret_problem, settings
 from .templating import templates  # shared Jinja env — version global lives here
 
 # Configure structured JSON logging before any module-level log calls fire.
@@ -174,11 +174,28 @@ def _warn_if_legacy_basic_auth_is_locked() -> None:
         )
 
 
+def _refuse_an_unusable_jwt_secret() -> None:
+    """Stop the start-up when JWT_SECRET cannot protect a session.
+
+    Whoever knows the secret signs a session for any role, platform_admin
+    included. So web does not serve with one of the repository's published
+    placeholders, nor with one too short for HS256: uvicorn exits, and the
+    reason is the last line of the log.
+    """
+    problem = jwt_secret_problem(settings.jwt_secret)
+    if problem is None:
+        return
+    fix = "generate one with `openssl rand -base64 64`, set JWT_SECRET in docker/.env, start again"
+    log.error("jwt_secret.refused", reason=f"JWT_SECRET {problem}", fix=fix)
+    raise RuntimeError(f"JWT_SECRET {problem}: {fix}.")
+
+
 @app.on_event("startup")
 def _startup() -> None:
     """Run once per worker. Schema is owned by Alembic and applied by the
     container entrypoint *before* uvicorn — we just bootstrap runtime state.
     """
+    _refuse_an_unusable_jwt_secret()
     settings.inbox_dir.mkdir(parents=True, exist_ok=True)
     _warn_if_legacy_basic_auth_is_locked()
     # #407 — the bundled TLS intermediate of the AT NAP hosts, near expiry.

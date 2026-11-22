@@ -20,6 +20,9 @@ os.environ.setdefault(
 )
 os.environ.setdefault("ADMIN_USER", "test-admin")
 os.environ.setdefault("ADMIN_PASSWORD", "test-admin")
+# Web refuses to start on the placeholder default of `Settings.jwt_secret`
+# (app/main.py `_startup`), so the tests sign their sessions with this one.
+os.environ.setdefault("JWT_SECRET", "tests-only-jwt-secret-never-set-on-any-deployment")
 # In tests we never want APScheduler / cron threads ticking in the background.
 os.environ.setdefault("VIATOR_DISABLE_CRONS", "1")
 # ────────────────────────────────────────────────────────────────────────────

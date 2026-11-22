@@ -51,6 +51,24 @@ def switch_or_default(value: Any, default: bool, name: str) -> bool:
     return default
 
 
+# HS256 signs with the secret itself: one shorter than the 256-bit digest is
+# weaker than the signature it produces (RFC 7518, section 3.2).
+JWT_SECRET_MIN_BYTES = 32
+# The placeholders this repository publishes all begin so: the default of
+# `Settings.jwt_secret` below and the line of docker/.env.example. Anyone can
+# read them, so a session signed with one proves nothing.
+_PLACEHOLDER_PREFIX = "change-me"
+
+
+def jwt_secret_problem(secret: str) -> str | None:
+    """Why `secret` may not sign sessions, in words for the operator; None when it may."""
+    if secret.startswith(_PLACEHOLDER_PREFIX):
+        return "is still a placeholder published in the repository"
+    if len(secret.encode("utf-8")) < JWT_SECRET_MIN_BYTES:
+        return f"is shorter than {JWT_SECRET_MIN_BYTES} bytes"
+    return None
+
+
 class Settings(BaseSettings):
     # Persistence
     database_url: str = "postgresql+psycopg://otp:otp@postgres:5432/otp"
@@ -100,8 +118,10 @@ class Settings(BaseSettings):
     motis_serve_mem_limit: str = ""
     motis_build_mem_limit: str = ""
 
-    # JWT-based auth (step 3+)
-    jwt_secret: str = "change-me-in-prod-use-32-bytes-random"  # noqa: S105 — placeholder default; .env JWT_SECRET MUST override in any non-dev environment
+    # JWT-based auth (step 3+). Web refuses to start on this placeholder, on the
+    # one of docker/.env.example and on any secret under 32 bytes
+    # (`jwt_secret_problem`, checked in app/main.py `_startup`).
+    jwt_secret: str = "change-me-in-prod-use-32-bytes-random"  # noqa: S105 — placeholder default; JWT_SECRET must replace it
     jwt_alg: str = "HS256"
     jwt_ttl_seconds: int = 12 * 3600  # 12 h
     jwt_cookie_name: str = "viator_jwt"

@@ -75,7 +75,10 @@ Three details in that picture are easy to get backwards and expensive to debug:
 - **`web` cannot restart containers.** It has no Docker socket. It writes the generated compose and
   nginx fragments plus a `.reload-trigger` sentinel; the worker picks them up on its next tick.
 - **`web` (and the worker's coverage executor) reach the engine containers directly by DNS**, not through nginx. The nginx
-  `/otp/<sid>/` and `/motis/<sid>/` routes exist for the operator's browser.
+  `/otp/<sid>/` and `/motis/<sid>/` routes exist for the operator's browser, and are served to signed-in
+  sessions only: the engines have no authentication of their own, so each generated `location` carries the
+  `auth_request` of `/grafana/` (`sessions_orchestrator.render_nginx`) and forwards neither the cookie nor a
+  bearer token.
 
 ### 2.2 Layers
 
@@ -278,7 +281,7 @@ and is off unless both are set.
 | POST | `/api/auth/login` | JWT + httpOnly cookie; 20/15min | anon |
 | POST | `/api/auth/logout` | Clears cookie (on a *fresh* Response — see trap) | anon |
 | GET | `/api/auth/me` | Current identity | logged-in |
-| GET | `/api/auth/proxy-validate` | nginx `auth_request` for Grafana/Prometheus; identity in headers | logged-in |
+| GET | `/api/auth/proxy-validate` | nginx `auth_request` for Grafana/Prometheus and the per-session engine routes; identity in headers | logged-in |
 | POST | `/api/auth/password-reset-request` / `-confirm` | Always 204 / 2 h TTL token; 5 and 10 per hour | anon |
 | POST | `/api/auth/bootstrap-platform-user` | First admin only; 403 forever once one exists; 3/hour | token |
 | GET | `/login`, `/register`, `/confirm/{t}`, `/reset[/{t}]` | Auth page shells | anon |
@@ -2010,9 +2013,18 @@ Rate limits, all on `/api/auth/*` and nowhere else: `register-request` 5/hour,
 - **Coverage runs freeze their config.** `execute_run` reads `CoverageConfig` once, freezes it on the
   row (`execution_snapshot`) and holds it for the run's lifetime, resumes included; changing a
   `COVERAGE_*` knob mid-run does nothing.
-- **Insecure `settings.py` defaults must be overridden in `.env`.** `jwt_secret="change-me-in-prod-…"`
-  and `jwt_cookie_secure=False` (the session cookie will be sent over plaintext until this is `True`
-  behind TLS). `admin_user` and `admin_password` default to empty, which leaves the legacy surface off.
+- **Insecure `settings.py` defaults must be overridden in `.env`.** `jwt_cookie_secure=False` (the
+  session cookie will be sent over plaintext until this is `True` behind TLS). `admin_user` and
+  `admin_password` default to empty, which leaves the legacy surface off. `jwt_secret` is the one
+  default web no longer serves with: `_startup` stops on a published placeholder (the default, the line
+  of `.env.example`) and on a secret under 32 bytes (`settings.jwt_secret_problem`). The worker does not
+  check it; it only derives the credential key from it.
+- **A session's id and settings are checked twice, on purpose.** They are written into the compose
+  fragment the worker applies and into nginx `location`s. The API checks them when a session is created
+  and when it is saved (`session_config.is_session_id`, `validate_settings`), and the orchestrator
+  checks again what it renders: a row with an id that is not a slug, or an unknown category, is left
+  out and logged; a serve heap that is not a JVM size is replaced by the default. Add a new setting
+  that reaches a fragment to `validate_settings`, and render it through a check of its own.
 - **The Phase-1 basic-auth surface is still in the code** on `/` and `/upload`, and is live only when
   `ADMIN_USER` and `ADMIN_PASSWORD` are both set. Setting `ADMIN_USER` empty puts the deployment in
   "Phase-2 mode": `authed_or_none` returns `None` and `/` redirects to `/login` instead of firing the

@@ -59,6 +59,7 @@ from ... import (
     nap_source_map,
     refresh_progress,
     serve_memory,
+    session_config,
     sessions_orchestrator,
     staleness,
     station_builds,
@@ -105,7 +106,15 @@ _SOURCE_KEY_TO_KIND: dict[str, str] = {
 _VALID_CATEGORIES = {c.value for c in SessionCategory}
 _VALID_STATES = {s.value for s in SessionState}
 _VALID_ENGINES = {e.value for e in SessionEngine}
-_SLUG = re.compile(r"^[a-z][a-z0-9-]{1,62}$")
+
+
+def _check_settings(config: dict[str, Any]) -> None:
+    """400 when a per-session setting of `config` is not one the build and the
+    orchestrator accept; each valid one is left in its canonical form."""
+    try:
+        session_config.validate_settings(config)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 class SessionCreate(BaseModel):
@@ -223,7 +232,7 @@ async def serve_memory_usage(
         # engine / actor validation). Same pattern as patch_session.
         # `response_model=` dropped (S8409): FastAPI infers it from the
         # `-> SessionResponse` return annotation since 0.95+.
-        400: {"description": "Slug / category / engine validation failed."},
+        400: {"description": "Slug / category / engine / config field validation failed."},
         409: {
             "description": "The session exists already, or a provider declares a country "
             "neither VIATOR's Trainline list nor the station module knows."
@@ -237,12 +246,15 @@ def create_session(
     db: Annotated[DbSession, Depends(get_db)],
     actor: Annotated[CurrentUser, Depends(require_platform_admin)],
 ) -> SessionResponse:
-    if not _SLUG.match(body.id):
+    if not session_config.is_session_id(body.id):
         raise HTTPException(400, "Session id must be a slug: ^[a-z][a-z0-9-]+$")
     if body.category not in _VALID_CATEGORIES:
         raise HTTPException(400, f"Invalid category. Must be one of {sorted(_VALID_CATEGORIES)}")
     if body.engine not in _VALID_ENGINES:
         raise HTTPException(400, f"Invalid engine. Must be one of {sorted(_VALID_ENGINES)}")
+    # The same checks as a save (`patch_session`): a session is rendered and
+    # built from the config it is created with.
+    _check_settings(body.config)
     if db.get(SessionRow, body.id) is not None:
         raise HTTPException(409, f"Session {body.id!r} already exists")
 
@@ -320,100 +332,10 @@ def patch_session(
         changes["name"] = {"from": s.name, "to": new_name}
         s.name = new_name
     if body.config is not None and body.config != s.config:
-        # Validate osm_scope if present — fail-fast at save time means the
-        # operator gets a clear UI error instead of an opaque build failure
-        # when osmium-tool errors out on an unknown scope name.
-        if "osm_scope" in body.config:
-            from ... import osm_filter
-
-            try:
-                body.config["osm_scope"] = osm_filter.validate_scope(body.config["osm_scope"])
-            except ValueError as exc:
-                raise HTTPException(400, str(exc)) from exc
-
-        # v0.1.21 — validate otp_timezone if present. Same fail-fast rationale:
-        # an invalid IANA tz here would cause OTP to refuse the build with
-        # "Cannot resolve zone id <bogus>". Catching at save time means the
-        # operator sees the error in a toast next to the dropdown instead of
-        # 5 minutes into a rebuild log.
-        if "otp_timezone" in body.config:
-            from ... import otp_timezone as _otp_tz
-
-            try:
-                body.config["otp_timezone"] = _otp_tz.validate_timezone(body.config["otp_timezone"])
-            except ValueError as exc:
-                raise HTTPException(400, str(exc)) from exc
-
-        # v0.1.23 — validate otp_build_heap. Same fail-fast pattern. A bad
-        # value (e.g. "12 GB" with a space, or "12gb" with the wrong unit)
-        # would silently fall back to the env-var default at the worker —
-        # confusing because the operator's deliberate UI choice would be
-        # invisibly ignored. Reject up front.
-        if "otp_build_heap" in body.config:
-            from ... import otp_heap as _otp_heap
-
-            try:
-                body.config["otp_build_heap"] = _otp_heap.validate_heap(
-                    body.config["otp_build_heap"]
-                )
-            except ValueError as exc:
-                raise HTTPException(400, str(exc)) from exc
-
-        # v0.1.32.21 — validate otp_heap (the SERVE-time JVM -Xmx, distinct
-        # from otp_build_heap above). Used by the per-session OTP serving
-        # container after the build completes. Same fail-fast pattern as
-        # otp_build_heap. Surfaced 2026-05-10 when an operator picked a
-        # 64g build heap, the build succeeded, but the serving container
-        # crash-looped at the hidden 4g default — see audit-2026-05.md.
-        if "otp_heap" in body.config:
-            from ... import otp_heap as _otp_heap
-
-            try:
-                body.config["otp_heap"] = _otp_heap.validate_heap(body.config["otp_heap"])
-            except ValueError as exc:
-                # 400 is already declared on the route decorator's `responses`
-                # parameter (set in v0.1.32.21 alongside this validation
-                # block); SonarCloud rule python:S6788 is satisfied at the
-                # decorator level, not per-raise.
-                raise HTTPException(400, str(exc)) from exc
-
-        # v0.1.24 — validate otp_api_timeout. Operator picks how long OTP
-        # is allowed to spend per journey-search request. Bad values
-        # (e.g. "30 s" with a space, "30sec", ISO-8601 "PT30S") would
-        # silently fall back to default; reject up front for the same
-        # reason as the other knobs.
-        if "otp_api_timeout" in body.config:
-            from ... import otp_api_timeout as _otp_api_timeout
-
-            try:
-                body.config["otp_api_timeout"] = _otp_api_timeout.validate_timeout(
-                    body.config["otp_api_timeout"]
-                )
-            except ValueError as exc:
-                raise HTTPException(400, str(exc)) from exc
-
-        # Every rebuild in max-memory mode (the Rebuild section's "Always for
-        # this session"): true or false only, so a stray string never turns
-        # it on (`ingestion.wants_max_memory` reads only a literal true).
-        if ingestion.BUILD_MAX_MEMORY in body.config and not isinstance(
-            body.config[ingestion.BUILD_MAX_MEMORY], bool
-        ):
-            raise HTTPException(400, f"{ingestion.BUILD_MAX_MEMORY} must be true or false")
-
-        # v0.1.40 — validate osm_countries (the GEOGRAPHIC scope: crop the OSM
-        # street graph to these served countries, orthogonal to osm_scope's
-        # tag filter). Same fail-fast pattern; an unknown ISO code 400s here
-        # rather than producing an empty crop polygon at build time. See
-        # docs/osm-geographic-scope-design.md.
-        if "osm_countries" in body.config:
-            from ... import osm_geo as _osm_geo
-
-            try:
-                body.config["osm_countries"] = _osm_geo.validate_countries(
-                    body.config["osm_countries"]
-                )
-            except ValueError as exc:
-                raise HTTPException(400, str(exc)) from exc
+        # Fail fast at save time: the operator sees the error next to the
+        # field instead of minutes into a rebuild log, and nothing but a
+        # checked value reaches the build or the rendered compose fragment.
+        _check_settings(body.config)
 
         # Validate provider bundles (v0.1.6) on save. We accept the legacy
         # gtfs[]/gtfs="..." shapes too (normalize_providers handles them),

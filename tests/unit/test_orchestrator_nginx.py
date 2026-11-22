@@ -106,3 +106,69 @@ def test_empty_input_produces_only_header():
 
     assert "DO NOT EDIT BY HAND" in out
     assert "location" not in out  # no per-session blocks
+
+
+# The planners have no authentication of their own: nginx asks web first.
+
+
+@dataclass
+class _EngineSession:
+    """A serving session with its engine, for the blocks of both planners."""
+
+    id: str
+    engine: str
+    state: str = SessionState.SERVING.value
+
+
+def _blocks(out: str) -> list[str]:
+    """The `location ... { ... }` blocks of a rendered fragment."""
+    return ["location " + block for block in out.split("location ")[1:]]
+
+
+def test_every_engine_location_asks_web_before_it_forwards():
+    """A planner answers whoever reaches it. nginx must ask web first
+    (`auth_request`, as for /grafana/ and /prometheus/), in the block of each
+    engine, and send a caller who is not signed in to the login page."""
+    from app.sessions_orchestrator import render_nginx
+
+    out = render_nginx(
+        [_EngineSession(id="nap-fr-rail", engine="otp"), _EngineSession(id="eu19", engine="motis")]
+    )
+
+    blocks = _blocks(out)
+    assert len(blocks) == 2
+    for block in blocks:
+        assert "    auth_request /api/auth/proxy-validate;\n" in block
+        assert "    error_page 401 = @auth_redirect;\n" in block
+        assert block.index("auth_request") < block.index("proxy_pass")
+
+
+def test_the_callers_session_is_not_forwarded_to_a_planner():
+    """The cookie and a bearer token authenticate the caller to VIATOR. A
+    planner has no use for either, so neither leaves nginx."""
+    from app.sessions_orchestrator import render_nginx
+
+    out = render_nginx(
+        [_EngineSession(id="nap-fr-rail", engine="otp"), _EngineSession(id="eu19", engine="motis")]
+    )
+
+    for block in _blocks(out):
+        assert '    proxy_set_header Cookie "";\n' in block
+        assert '    proxy_set_header Authorization "";\n' in block
+
+
+def test_nginx_conf_declares_what_the_engine_locations_refer_to():
+    """`auth_request` and `error_page` name two locations of nginx.conf. If
+    either went missing, nginx would refuse the whole configuration at its
+    next restart; and they must sit in the server block that includes the
+    generated fragment."""
+    from pathlib import Path
+
+    conf = (Path(__file__).resolve().parents[2] / "docker" / "nginx" / "nginx.conf").read_text(
+        encoding="utf-8"
+    )
+
+    https_server = conf[conf.index("listen 443 ssl") :]
+    assert "location = /api/auth/proxy-validate {" in https_server
+    assert "location @auth_redirect {" in https_server
+    assert "include /etc/nginx/conf.d/sessions/*.conf;" in https_server

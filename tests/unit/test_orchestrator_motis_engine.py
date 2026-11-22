@@ -50,11 +50,11 @@ def test_motis_service_points_at_engine_specific_data_dir():
 
     Post Phase-0.5: `motis server` takes `--data <dir>`, NOT `--config <file>`.
     The dir is the import output path; config.yml lives inside it."""
-    out = render_compose([_StubSession(id="x", engine="motis")])
+    out = render_compose([_StubSession(id="xx", engine="motis")])
     assert "--data" in out
-    assert "/var/motis-graphs/motis/x/current" in out
+    assert "/var/motis-graphs/motis/xx/current" in out
     # Verify we're NOT passing the wrong flag (caught by Phase-0.5 spike).
-    assert "--config" not in out.split("motis-x:")[1].split("\n\n")[0]
+    assert "--config" not in out.split("motis-xx:")[1].split("\n\n")[0]
 
 
 def test_motis_healthcheck_uses_root_endpoint_not_api_v6():
@@ -62,8 +62,8 @@ def test_motis_healthcheck_uses_root_endpoint_not_api_v6():
     rejects empty params). A failing probe would treat that as failure and
     crash-loop the container. `GET /` returns 200 (the splash page MOTIS
     prints on boot) — that's the cheapest healthcheck signal."""
-    out = render_compose([_StubSession(id="x", engine="motis")])
-    motis_block = out.split("motis-x:")[1].split("\n\n")[0]
+    out = render_compose([_StubSession(id="xx", engine="motis")])
+    motis_block = out.split("motis-xx:")[1].split("\n\n")[0]
     # Right endpoint is `/`. Wrong endpoint is `/api/v6/` (would 400).
     assert "http://localhost:8080/" in motis_block
     assert "localhost:8080/api/v6/" not in motis_block
@@ -89,8 +89,8 @@ def test_motis_healthcheck_uses_wget_not_curl():
 
     `--spider` is deliberately not asserted: a plain GET (`-O /dev/null`) is
     what was verified working, and `--spider` was not."""
-    out = render_compose([_StubSession(id="x", engine="motis")])
-    motis_block = out.split("motis-x:")[1].split("\n\n")[0]
+    out = render_compose([_StubSession(id="xx", engine="motis")])
+    motis_block = out.split("motis-xx:")[1].split("\n\n")[0]
     # Pull out the `test:` line — the actual healthcheck command — so the
     # negative `curl` assertion isn't tripped by explanatory YAML comments
     # that mention curl in passing.
@@ -120,8 +120,8 @@ def test_motis_healthcheck_timeout_tolerates_transient_slowness_under_load():
 
     The wider budgets are kept anyway: harmless, and defensible on their own
     terms once the probe reaches a listening socket."""
-    out = render_compose([_StubSession(id="x", engine="motis")])
-    motis_block = out.split("motis-x:")[1].split("\n\n")[0]
+    out = render_compose([_StubSession(id="xx", engine="motis")])
+    motis_block = out.split("motis-xx:")[1].split("\n\n")[0]
     test_line = next(line for line in motis_block.splitlines() if line.lstrip().startswith("test:"))
     timeout_line = next(
         line for line in motis_block.splitlines() if line.lstrip().startswith("timeout:")
@@ -138,8 +138,8 @@ def test_motis_service_overrides_container_user_to_root():
     Without `user: "0:0"`, the serve container can't map the read-only
     data dir cleanly (silent failures + permission quirks). The worker's
     build runs already pass `--user 0:0`; the serve template mirrors it."""
-    out = render_compose([_StubSession(id="x", engine="motis")])
-    motis_block = out.split("motis-x:")[1].split("\n\n")[0]
+    out = render_compose([_StubSession(id="xx", engine="motis")])
+    motis_block = out.split("motis-xx:")[1].split("\n\n")[0]
     assert 'user: "0:0"' in motis_block
 
 
@@ -150,7 +150,7 @@ def test_motis_healthcheck_start_period_respects_session_config():
     out = render_compose(
         [
             _StubSession(
-                id="x",
+                id="xx",
                 engine="motis",
                 config={"otp_serve_start_period": 600},
             )
@@ -177,19 +177,19 @@ def test_legacy_session_without_engine_renders_as_otp():
     """A pre-migration row with engine=None must NOT be silently dropped
     or rendered as MOTIS — operator expectation is bit-identical to
     pre-P1 behaviour."""
-    out = render_compose([_StubSession(id="x", engine=None)])
-    assert "otp-x:" in out
-    assert "motis-x:" not in out
+    out = render_compose([_StubSession(id="xx", engine=None)])
+    assert "otp-xx:" in out
+    assert "motis-xx:" not in out
 
 
 def test_non_serving_motis_session_renders_nothing():
     """Just like OTP, only SERVING sessions appear in the compose
     fragment — graph_built or earlier states are still being prepared."""
     out = render_compose(
-        [_StubSession(id="x", engine="motis", state=SessionState.GRAPH_BUILT.value)]
+        [_StubSession(id="xx", engine="motis", state=SessionState.GRAPH_BUILT.value)]
     )
-    assert "motis-x:" not in out
-    assert "otp-x:" not in out
+    assert "motis-xx:" not in out
+    assert "otp-xx:" not in out
 
 
 def test_motis_service_carries_autoheal_optin_label():
@@ -199,8 +199,8 @@ def test_motis_service_carries_autoheal_optin_label():
     in docker/docker-compose.yml, (2) this label on every serve container
     that should be restarted when its healthcheck flips. Postgres and other
     stateful services are deliberately NOT labelled."""
-    out = render_compose([_StubSession(id="x", engine="motis", state=SessionState.SERVING.value)])
-    motis_block = out.split("motis-x:")[1].split("\n\n")[0]
+    out = render_compose([_StubSession(id="xx", engine="motis", state=SessionState.SERVING.value)])
+    motis_block = out.split("motis-xx:")[1].split("\n\n")[0]
     assert "viator.autoheal" in motis_block
     assert '"true"' in motis_block
 
@@ -210,8 +210,8 @@ def test_otp_service_carries_autoheal_optin_label():
     has its own healthcheck (curl /otp/) and the same failure-mode risk,
     so it opts into autoheal the same way. Prevents an asymmetry where
     only MOTIS sessions get watchdog coverage."""
-    out = render_compose([_StubSession(id="x", engine="otp", state=SessionState.SERVING.value)])
-    otp_block = out.split("otp-x:")[1].split("\n\n")[0]
+    out = render_compose([_StubSession(id="xx", engine="otp", state=SessionState.SERVING.value)])
+    otp_block = out.split("otp-xx:")[1].split("\n\n")[0]
     assert "viator.autoheal" in otp_block
     assert '"true"' in otp_block
 
@@ -229,8 +229,8 @@ def test_motis_nginx_block_strips_prefix_in_rewrite():
     """MOTIS's API doesn't carry an /otp/ namespace; the proxied request
     must drop the `/motis/<sid>/` prefix entirely so the upstream sees
     `/api/v6/plan` (not `/motis/<sid>/api/v6/plan`)."""
-    out = render_nginx([_StubSession(id="x", engine="motis")])
-    assert "rewrite ^/motis/x/(.*)$ /$1 break;" in out
+    out = render_nginx([_StubSession(id="xx", engine="motis")])
+    assert "rewrite ^/motis/xx/(.*)$ /$1 break;" in out
 
 
 def test_motis_nginx_uses_dynamic_upstream_pattern():

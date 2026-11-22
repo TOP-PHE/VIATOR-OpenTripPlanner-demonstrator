@@ -153,7 +153,7 @@ def normalize_gtfs_sources(raw: object) -> list[dict[str, str]]:
             raise ValueError(f"feeds[{i}] must be an object with 'id' and 'url'")
         feed_id = (entry.get("id") or "").strip()
         url = (entry.get("url") or "").strip()
-        if not feed_id or not _FEED_ID_RE.match(feed_id):
+        if not feed_id or not _FEED_ID_RE.fullmatch(feed_id):
             raise ValueError(
                 f"feeds[{i}].id={feed_id!r} must match /^[A-Z][A-Z0-9_-]{{1,15}}$/ "
                 "(e.g. SNCF, IDFM, TRENITALIA, FR-SNCF)"
@@ -333,7 +333,7 @@ def _validate_cross_border_filter(tt: dict[str, Any], index: int) -> dict[str, A
             f"providers[{index}].timetable.derived_from.session_id is required "
             "(the session whose national feed is filtered)"
         )
-    if not _FEED_ID_RE.match(src_provider):
+    if not _FEED_ID_RE.fullmatch(src_provider):
         raise ValueError(
             f"providers[{index}].timetable.derived_from.provider_id={src_provider!r} "
             "must be a provider id (e.g. RENFE) in the source session"
@@ -344,7 +344,7 @@ def _validate_cross_border_filter(tt: dict[str, Any], index: int) -> dict[str, A
     home_raw = tt.get("home_country")
     if home_raw not in (None, ""):
         home = str(home_raw).strip().upper()
-        if not _COUNTRY_ISO_RE.match(home):
+        if not _COUNTRY_ISO_RE.fullmatch(home):
             raise ValueError(
                 f"providers[{index}].timetable.home_country={home_raw!r} must be a "
                 "2-letter ISO code (ES, FR, ...) — origin-country ownership for the filter"
@@ -392,7 +392,7 @@ def _validate_provider(raw: object, index: int) -> dict[str, Any]:
 
     # ── id ────────────────────────────────────────────────────────────
     feed_id = (raw.get("id") or "").strip()
-    if not feed_id or not _FEED_ID_RE.match(feed_id):
+    if not feed_id or not _FEED_ID_RE.fullmatch(feed_id):
         raise ValueError(
             f"providers[{index}].id={feed_id!r} must match "
             "/^[A-Z][A-Z0-9_-]{1,15}$/ (e.g. SNCF, IDFM, TRENITALIA, FR-SNCF)"
@@ -406,7 +406,7 @@ def _validate_provider(raw: object, index: int) -> dict[str, Any]:
     country_iso: str | None = None
     if country_iso_raw not in (None, ""):
         ci = str(country_iso_raw).strip().upper()
-        if not _COUNTRY_ISO_RE.match(ci):
+        if not _COUNTRY_ISO_RE.fullmatch(ci):
             raise ValueError(
                 f"providers[{index}].country_iso={country_iso_raw!r} must be "
                 "a 2-letter ISO code (FR, DE, IT, ...)"
