@@ -72,16 +72,21 @@ def _create(session_id: str, config: dict[str, Any], db: Any) -> sessions.Sessio
     ],
 )
 def test_a_creation_with_a_setting_a_save_refuses_is_refused(config: dict[str, Any]) -> None:
+    database = _Untouched()
+
     with pytest.raises(HTTPException) as refused:
-        _create("zz-new", config, _Untouched())
+        _create("zz-new", config, database)
 
     assert refused.value.status_code == 400
 
 
 @pytest.mark.parametrize("session_id", ["zz-new\n", "zz new", "Zz-new", "zz/new"])
 def test_a_creation_with_an_id_that_is_not_a_slug_is_refused(session_id: str) -> None:
+    database = _Untouched()
+    config: dict[str, Any] = {}
+
     with pytest.raises(HTTPException) as refused:
-        _create(session_id, {}, _Untouched())
+        _create(session_id, config, database)
 
     assert refused.value.status_code == 400
     assert "slug" in str(refused.value.detail)
@@ -91,9 +96,10 @@ def test_a_creation_stores_its_settings_in_their_canonical_form() -> None:
     body = sessions.SessionCreate(
         id="zz-new", name="Zz", category="MANUAL", config={"otp_heap": "24G"}
     )
+    request, response, database, actor = _request(), Response(), _Db(None), _actor()
 
     with pytest.raises(_Reached):
-        sessions.create_session(body, _request(), Response(), _Db(None), _actor())
+        sessions.create_session(body, request, response, database, actor)
 
     assert body.config == {"otp_heap": "24g"}
 
@@ -101,9 +107,10 @@ def test_a_creation_stores_its_settings_in_their_canonical_form() -> None:
 def test_a_save_still_refuses_the_same_settings() -> None:
     row = SimpleNamespace(id="zz-session", name="Zz", config={}, state="created")
     patch = sessions.SessionPatch(config={"otp_heap": _EXTRA_KEYS})
+    request, response, database, actor = _request(), Response(), _Db(row), _actor()
 
     with pytest.raises(HTTPException) as refused:
-        sessions.patch_session("zz-session", patch, _request(), Response(), _Db(row), _actor())
+        sessions.patch_session("zz-session", patch, request, response, database, actor)
 
     assert refused.value.status_code == 400
     assert row.config == {}
