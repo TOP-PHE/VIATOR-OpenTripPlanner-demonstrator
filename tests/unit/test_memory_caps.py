@@ -165,10 +165,12 @@ def test_otp_serve_headroom_setting_widens_the_cap(monkeypatch: pytest.MonkeyPat
     assert (svc["mem_limit"], svc["memswap_limit"]) == ("22g", "22g")
 
 
-def test_otp_serve_with_a_malformed_heap_gets_no_cap() -> None:
+def test_otp_serve_with_a_malformed_heap_gets_the_default_heap_and_its_cap() -> None:
+    # A heap that is not a JVM size is never written into the fragment: the
+    # default serve heap is (4g without a build heap), capped like any 4g heap.
     svc = _services([_StubSession(id="zz-otp", config={"otp_heap": "lots"})])["otp-zz-otp"]
-    assert "mem_limit" not in svc
-    assert "memswap_limit" not in svc
+    assert svc["environment"]["OTP_HEAP"] == "4g"
+    assert (svc["mem_limit"], svc["memswap_limit"]) == ("10g", "10g")
 
 
 def test_motis_serve_has_no_cap_by_default() -> None:

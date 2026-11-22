@@ -658,7 +658,9 @@ searches 12:51 graph-local" semantics. A tz-aware time (e.g. the
 shape the server sends):
 
 ```bash
+# VIATOR_JWT: the value of your browser's `viator_jwt` cookie (admin-guide §5.4).
 curl -sk https://localhost/otp/nap-ch-rail/gtfs/v1 \
+  -b "viator_jwt=$VIATOR_JWT" \
   -H "Content-Type: application/json" \
   -d '{"query":"{ planConnection(origin:{location:{stopLocation:{stopLocationId:\"SBB:Parent8771500\"}}}, destination:{location:{stopLocation:{stopLocationId:\"SBB:Parent8504215\"}}}, dateTime:{earliestDeparture:\"2026-05-18T06:00:00+02:00\"}, searchWindow:\"PT8H\", first:3) { edges { node { start end duration legs { mode from { name } to { name } route { shortName } } } } routingErrors { code description } } }"}' \
   | python3 -m json.tool

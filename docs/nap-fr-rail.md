@@ -646,14 +646,15 @@ docker logs -f viator-otp-nap-fr-rail-1 | grep -E 'Grizzly|Updaters|UPDATERS'
 Then test routing:
 
 ```bash
+# VIATOR_JWT: the value of your browser's `viator_jwt` cookie (admin-guide §5.4).
 # GraphQL ping — confirms OTP is reachable and the feed loaded
-curl -sk -X POST -H 'content-type: application/json' \
+curl -sk -X POST -H 'content-type: application/json' -b "viator_jwt=$VIATOR_JWT" \
   -d '{"query":"{ feeds { feedId } serviceTimeRange { start end } }"}' \
   https://<your-host>/otp/nap-fr-rail/gtfs/v1 | python3 -m json.tool
 # Expected: feedId="SNCF", serviceTimeRange spanning today
 
 # Real query — Paris Gare de Lyon → Lyon Part-Dieu via TGV
-curl -sk -X POST -H 'content-type: application/json' \
+curl -sk -X POST -H 'content-type: application/json' -b "viator_jwt=$VIATOR_JWT" \
   -d '{"query":"{ plan(from: {lat: 48.8443, lon: 2.3744}, to: {lat: 45.7605, lon: 4.8595}, date: \"2026-05-15\", time: \"08:30\", numItineraries: 5, searchWindow: 14400) { itineraries { duration legs { mode route { shortName longName } from { name } to { name } } } } }"}' \
   https://<your-host>/otp/nap-fr-rail/gtfs/v1 | python3 -m json.tool
 # Expected: 5 itineraries, RAIL legs with route shortName like "601A"
