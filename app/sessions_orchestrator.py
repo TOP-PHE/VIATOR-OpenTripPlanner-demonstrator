@@ -371,10 +371,11 @@ def render_compose(sessions: list[SessionRow]) -> str:
 
 
 # The planners have no authentication of their own, so nginx asks web before it
-# forwards anything to one: the same `auth_request` as /grafana/ and
-# /prometheus/, which any signed-in role passes (the roles the journey API
-# accepts). The endpoint and `@auth_redirect` are in docker/nginx/nginx.conf, in
-# the server block that includes this fragment.
+# forwards anything to one: an `auth_request` on the endpoint any signed-in
+# role passes (the roles the journey API accepts). /grafana/ and /prometheus/
+# ask another one, for platform administrators only. Both endpoints and
+# `@auth_redirect` are in docker/nginx/nginx.conf, in the server block that
+# includes this fragment.
 _NGINX_ACCESS_LINES = (
     "    auth_request /api/auth/proxy-validate;\n    error_page 401 = @auth_redirect;\n"
 )

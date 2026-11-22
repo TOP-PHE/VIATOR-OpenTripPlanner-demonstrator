@@ -6,7 +6,8 @@ Static checks (CI runs no nginx and no Grafana):
 - `/grafana/` and `/prometheus/` ask the administrators' validation endpoint
   and do not pass the client's `Authorization` header on;
 - the endpoint every signed-in role may ask is still there for the locations
-  outside this file (the station mapping module's include);
+  outside this file (the generated per-session engine routes, the station
+  mapping module's include);
 - each path nginx asks is a route of the application;
 - every location that passes a request to web sets `X-Real-IP` from the
   connection, and no location forwards the client's own `X-Forwarded-For`;

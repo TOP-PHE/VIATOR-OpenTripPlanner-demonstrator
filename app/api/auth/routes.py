@@ -316,9 +316,11 @@ async def me(
 # Two endpoints, one per rule:
 #   - /proxy-validate        any signed-in role. Asked by the locations that
 #                            only need a session, and check the role
-#                            themselves if they need one: the station mapping
-#                            module's include reads `X-Forwarded-User` and
-#                            `X-Viator-Role` from the answer.
+#                            themselves if they need one: the per-session
+#                            engine routes (`sessions_orchestrator`), and
+#                            the station mapping module's include, which
+#                            reads `X-Forwarded-User` and `X-Viator-Role`
+#                            from the answer.
 #   - /proxy-validate-admin  `platform_admin` only. Asked by `/grafana/` and
 #                            `/prometheus/`: the logs, traces and metrics of
 #                            every container are an administrator's to read.

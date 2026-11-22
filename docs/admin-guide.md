@@ -752,8 +752,9 @@ sudo du -sh /var/lib/docker/volumes/viator_*
 **The planners' public paths need a signed-in session.** `/otp/<sid>/` and
 `/motis/<sid>/` are served to signed-in users only, whatever their role: OTP
 and MOTIS have no authentication of their own, so nginx asks web first
-(`auth_request` on `/api/auth/proxy-validate`, as for `/grafana/` and
-`/prometheus/`). A request without a valid session is sent to `/login`. From
+(`auth_request` on `/api/auth/proxy-validate`; `/grafana/` and
+`/prometheus/` ask the administrators' endpoint instead, §5.5). A request
+without a valid session is sent to `/login`. From
 a terminal, either ask the planner inside its container, as above, or send
 your session: `-b "viator_jwt=$VIATOR_JWT"`, where `VIATOR_JWT` holds the
 value of your browser's `viator_jwt` cookie. The journey API and the coverage
@@ -993,7 +994,8 @@ its client addresses, the station module), the traces and the metrics.
   session, else 200 with the user identity emitted as response headers
   (`X-Forwarded-User`, `X-Forwarded-Role`). Its twin
   `/api/auth/proxy-validate` answers every signed-in role and serves
-  other locations (the station mapping module's, §11): leave it as it is.
+  other locations (the planners' paths, §5.4; the station mapping
+  module's, §11): leave it as it is.
 - nginx forwards those as `X-WEBAUTH-USER` to Grafana, which auto-creates
   users on first sight, with Grafana's Admin role (only platform
   administrators get this far).

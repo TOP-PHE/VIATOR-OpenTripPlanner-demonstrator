@@ -76,9 +76,9 @@ Three details in that picture are easy to get backwards and expensive to debug:
   nginx fragments plus a `.reload-trigger` sentinel; the worker picks them up on its next tick.
 - **`web` (and the worker's coverage executor) reach the engine containers directly by DNS**, not through nginx. The nginx
   `/otp/<sid>/` and `/motis/<sid>/` routes exist for the operator's browser, and are served to signed-in
-  sessions only: the engines have no authentication of their own, so each generated `location` carries the
-  `auth_request` of `/grafana/` (`sessions_orchestrator.render_nginx`) and forwards neither the cookie nor a
-  bearer token.
+  sessions only: the engines have no authentication of their own, so each generated `location` carries an
+  `auth_request` on `/api/auth/proxy-validate`, which every signed-in role passes (`sessions_orchestrator.render_nginx`),
+  and forwards neither the cookie nor a bearer token.
 
 ### 2.2 Layers
 
@@ -164,7 +164,7 @@ Three details in that picture are easy to get backwards and expensive to debug:
 5. First-ever admin: `POST /api/auth/bootstrap-platform-user` (3/hour). Compares `settings.bootstrap_token` with `secrets.compare_digest`, and **403s permanently once any platform_admin exists** — so leaving `BOOTSTRAP_TOKEN` in `.env` is only a defence-in-depth issue, not an open door.
 6. Self-registration: `POST /api/auth/register-request` **always returns 204** (no email enumeration); creates a `VerificationToken` storing only the *hash* while the raw token goes out in the magic link via `auth/email.py::send_verification_email` → `/confirm/<raw>` → `GET /api/auth/check-token` → `POST /api/auth/register-confirm` (10/hour), which creates the `User` at `REGISTRATION_DEFAULT_ROLE` and issues a JWT. Gated by the `REGISTRATION_OPEN` config key.
 7. Password reset mirrors that exactly: `password-reset-request` (5/hour, always 204) → `PasswordResetToken` with 2 h TTL → `/reset/<raw>` → `password-reset-confirm`.
-8. Observability SSO, for platform administrators only: nginx `auth_request` on `/grafana/` and `/prometheus/` hits `GET /api/auth/proxy-validate-admin` (`require_platform_admin`), which returns 200 plus `X-Forwarded-User` / `X-Forwarded-Role` headers, 403 for any other role (nginx serves it as it is) and 401 without a session (nginx sends the browser to `/login`). Its twin `GET /api/auth/proxy-validate` answers the same headers to every signed-in role, for the locations that only need a session: the station mapping module's nginx include asks it and reads `X-Viator-Role` from the answer. The role is translated by `auth/grafana_role_map.py::viator_role_to_grafana` into Grafana's Admin/Editor/Viewer vocabulary, unknown roles falling back to Viewer. Both are deliberately separate from `/me` because they are hit on every proxied request and must not be rate-limited.
+8. Observability SSO, for platform administrators only: nginx `auth_request` on `/grafana/` and `/prometheus/` hits `GET /api/auth/proxy-validate-admin` (`require_platform_admin`), which returns 200 plus `X-Forwarded-User` / `X-Forwarded-Role` headers, 403 for any other role (nginx serves it as it is) and 401 without a session (nginx sends the browser to `/login`). Its twin `GET /api/auth/proxy-validate` answers the same headers to every signed-in role, for the locations that only need a session: the per-session engine routes ask it, and so does the station mapping module's nginx include, which reads `X-Viator-Role` from the answer. The role is translated by `auth/grafana_role_map.py::viator_role_to_grafana` into Grafana's Admin/Editor/Viewer vocabulary, unknown roles falling back to Viewer. Both are deliberately separate from `/me` because they are hit on every proxied request and must not be rate-limited.
 9. **Legacy surface still live:** `security.py::authed` (HTTP basic against `ADMIN_USER`/`ADMIN_PASSWORD`) still guards `/` and `/upload` in `main.py`. When `ADMIN_USER` is empty, `authed_or_none` returns `None` and `/` redirects to `/login` — this exists purely to avoid the browser's native basic-auth popup on a bare-hostname visit to a Phase-2 deployment. The credential exists only when both settings are non-empty: with either one empty, `authed` answers 401 to every request, so `/upload` is closed in Phase-2 mode.
 
 ---
@@ -281,7 +281,7 @@ and is off unless both are set.
 | POST | `/api/auth/login` | JWT + httpOnly cookie; 10/15min per client address and account, 20/15min per client address | anon |
 | POST | `/api/auth/logout` | Clears cookie (on a *fresh* Response — see trap) | anon |
 | GET | `/api/auth/me` | Current identity | logged-in |
-| GET | `/api/auth/proxy-validate` | nginx `auth_request` for Grafana/Prometheus and the per-session engine routes; identity in headers | logged-in |
+| GET | `/api/auth/proxy-validate` | nginx `auth_request` for the per-session engine routes and the station mapping module's include; identity in headers | logged-in |
 | POST | `/api/auth/password-reset-request` / `-confirm` | Always 204 / 2 h TTL token; 5 and 10 per hour | anon |
 | POST | `/api/auth/bootstrap-platform-user` | First admin only; 403 forever once one exists; 3/hour | token |
 | GET | `/api/auth/proxy-validate-admin` | nginx `auth_request` for Grafana/Prometheus; identity in headers; 403 for any other role | platform_admin |
@@ -415,10 +415,11 @@ display model in one place, `app/static/js/canonical_view.js`; no engine payload
   separate from `/me`: nginx hits one of them on every request it proxies behind an `auth_request`.
   Rate-limiting them breaks observability SSO.
 - **Two validation endpoints, two rules: do not narrow the first.** `/api/auth/proxy-validate` answers every
-  signed-in role and is asked from outside `nginx.conf` (the station mapping module's include reads
-  `X-Forwarded-User` and `X-Viator-Role` from it); `/api/auth/proxy-validate-admin` answers platform
-  administrators only and gates `/grafana/` and `/prometheus/`. A new location meant for administrators asks
-  the second; restricting the first would close the module's screens to the roles it serves.
+  signed-in role and is asked from outside `nginx.conf` (the generated per-session engine routes; the station
+  mapping module's include, which reads `X-Forwarded-User` and `X-Viator-Role` from it);
+  `/api/auth/proxy-validate-admin` answers platform administrators only and gates `/grafana/` and
+  `/prometheus/`. A new location meant for administrators asks the second; restricting the first would close
+  the planners' paths and the module's screens to the roles they serve.
 - **OSM refresh is a separate endpoint on purpose** — bundling it into `/sources/refresh` invalidates
   the streetGraph cache and adds ~30 min to the next build for a GTFS-only change.
 - **Credential and station secrets never round-trip.** `GET /api/credentials` returns `"********"`;
