@@ -51,12 +51,12 @@ Where the stations come from:
    Every value of `q` is a bound parameter, never in the statement's text,
    which VIATOR's SQLAlchemy tracing records.
 
-**No slowapi limit on this route, on purpose.** VIATOR's limiter keys on
-`request.client.host`, which behind nginx is nginx's own address for every
-user (docs/architecture.md ch. 9, "Invariants & traps"): it would be one
-counter for the whole site, which normal typing by a few people would use
-up. The per-user and overall limits are the module's own; the fallback
-serves VIATOR's Trainline list (ODbL), already public.
+**No slowapi limit on this route, on purpose.** The per-user and overall
+limits are the module's own; the fallback serves VIATOR's Trainline list
+(ODbL), already public. VIATOR's limiter counts by client address
+(app/rate_limit.py; docs/architecture.md ch. 9, "Invariants & traps"), which
+the people of one office share: a limit here would be one counter for all of
+them, which normal typing by a few people would use up.
 """
 
 from __future__ import annotations

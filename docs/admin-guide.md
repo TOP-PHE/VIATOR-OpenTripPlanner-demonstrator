@@ -972,8 +972,11 @@ location /metrics {
 
 `docker-compose.yml` ships **`prometheus`** and **`grafana`** services;
 both are reverse-proxied through nginx with VIATOR's JWT cookie as the
-auth gate. There's no second login — opening `/grafana/` after signing
-into the admin UI just works.
+auth gate, **for platform administrators only**. There's no second login —
+opening `/grafana/` after signing into the admin UI just works for an
+administrator. Any other role gets nginx's "403 Forbidden" page: Grafana
+shows the logs of every container (web, worker, PostgreSQL, nginx with
+its client addresses, the station module), the traces and the metrics.
 
 **How to use:**
 - `https://<host>/grafana/` — dashboards. Pre-provisioned starter
@@ -983,13 +986,20 @@ into the admin UI just works.
 
 **SSO mechanism:**
 - nginx's `/grafana/` and `/prometheus/` locations use `auth_request`
-  to call back to `/api/auth/proxy-validate` (an internal-only endpoint).
-- That endpoint re-uses the standard `current_user_jwt` dependency —
-  same logic as `/api/auth/me`, just with the user identity emitted as
-  response headers (`X-Forwarded-User`, `X-Forwarded-Role`).
+  to call back to `/api/auth/proxy-validate-admin` (an internal-only
+  endpoint).
+- That endpoint accepts a platform administrator's session only
+  (`require_platform_admin`): 403 for another role, 401 without a
+  session, else 200 with the user identity emitted as response headers
+  (`X-Forwarded-User`, `X-Forwarded-Role`). Its twin
+  `/api/auth/proxy-validate` answers every signed-in role and serves
+  other locations (the station mapping module's, §11): leave it as it is.
 - nginx forwards those as `X-WEBAUTH-USER` to Grafana, which auto-creates
-  users on first sight (Editor role by default; manually upgrade to
-  Admin in Grafana's user management for power users).
+  users on first sight, with Grafana's Admin role (only platform
+  administrators get this far).
+- nginx does not pass the browser's or a script's `Authorization` header
+  on to Grafana or Prometheus: a Grafana API token sent through
+  `/grafana/` is not seen by Grafana.
 - 401 from the auth-request bounces the operator to `/login?next=...`
   so the round-trip lands them back at the dashboard after sign-in, but
   only when the requested address has no query string. A deep link that
@@ -999,6 +1009,30 @@ into the admin UI just works.
   others) and must open the dashboard again. A platform administrator
   can use the "Admin dashboard" menu: its links carry no query string,
   so they are followed after sign-in; other roles have no such menu.
+
+**Grafana's own logins are switched off.** The header above is the only
+way in. `docker-compose.yml` sets, beside the login form already disabled:
+
+- `GF_AUTH_BASIC_ENABLED=false`: Grafana accepts no login and password in
+  an `Authorization: Basic` header.
+- `GF_SECURITY_DISABLE_INITIAL_ADMIN_CREATION=true`: a new install does not
+  create Grafana's built-in `admin` account. Nobody uses it: a platform
+  administrator has the Admin role of Grafana's organisation, which
+  covers dashboards, Explore and alerting.
+
+*On an install made before these two settings*, the built-in `admin`
+account is still in the `grafana-data` volume. It can no longer sign in,
+but replace its password once, after the deploy, with one nobody keeps:
+
+```bash
+cd /opt/viator/docker
+openssl rand -base64 32 | docker compose -p viator exec -T grafana \
+  grafana cli admin reset-admin-password --password-from-stdin
+```
+
+The Grafana accounts created earlier for VIATOR users who are not
+administrators stay in that volume too; they are harmless (those people
+no longer reach Grafana).
 
 **Tunables (in `.env`):**
 
@@ -1053,6 +1087,7 @@ Symptoms and fixes:
 | `/grafana/` 502 Bad Gateway | Grafana container isn't running or just restarted | `docker compose ps grafana` — if not Up, check `docker compose logs grafana`. Often nginx caches the dead IP for ~10s after recreate |
 | Grafana logs show `uname=patrick.heuguet@trackonpath.com` but you still see login | Grafana's auto-sign-up failed on a stale user record | Inside Grafana: Administration → Users → delete the half-created row; re-visit `/grafana/` to recreate clean |
 | `/grafana/` works the first time, then breaks after redeploy | Same as the second row — recreate Grafana | `docker compose up -d --force-recreate grafana` |
+| `/grafana/` or `/prometheus/` shows nginx's "403 Forbidden" | The session is not a platform administrator's | Expected for a content manager or an end user. For an administrator: `/api/auth/me` shows the role of the session; a role changed in VIATOR applies at the next sign-in |
 
 The `--force-recreate grafana` is the standard hammer. Doesn't lose any data — UI-edited dashboards, datasource configs, and user list all live in the `grafana-data` volume, which persists across recreations.
 
@@ -2887,6 +2922,55 @@ The pages show the same as before. If a page of a large run is still slow, look 
 log's request time for `/share/coverage/` and the rows of the run
 (`SELECT count(*) FROM network_coverage_results WHERE run_id = '<id>'`): the page grows with
 the number of cells, not with their journeys.
+
+### 6.32 Sign-in answers 429 "Rate limit exceeded": the limits, and whose address they count
+
+A few routes count their requests and answer **429** over a limit. Every
+counter is kept **per client address**: the address of the connection
+nginx accepted, which nginx hands to web in `X-Real-IP`. A client cannot
+choose it (web does not read `X-Forwarded-For`), and the same address is
+the `actor_ip` written in the audit events.
+
+| Route | Limit |
+|---|---|
+| Sign-in (`POST /api/auth/login`) | 10 per 15 minutes for one account from one address, and 20 per 15 minutes for one address, all accounts together |
+| Registration request, password-reset request | 5 per hour per address, each |
+| Registration confirmation, password-reset confirmation | 10 per hour per address, each |
+| First administrator (`bootstrap-platform-user`) | 3 per hour per address |
+| Share link of a coverage run, its cell details | 60 and 120 per minute per address |
+
+What follows for the people who sign in:
+
+- Someone who mistypes a password ten times waits for the end of the
+  quarter of an hour (it starts at the first attempt). The others behind
+  the same address (an office) are not affected by that account, and its
+  owner is not refused from another address.
+- Twenty attempts from one address on several accounts close sign-in to
+  everybody behind that address for the rest of the quarter of an hour.
+  People already signed in keep their session.
+- The counters live in web's memory: `docker compose -p viator restart web`
+  clears them all (and nothing else: sessions survive a restart).
+
+**Check, after a deploy that touches nginx or the network, that nginx sees
+the clients' own addresses.** The first field of an access-log line is
+that address:
+
+```bash
+docker compose -p viator logs --tail 50 nginx
+```
+
+It must be the public address of whoever made the request. If every line
+starts with an address of the Docker network (`172.…`), all those clients
+are one client for the limits: they share every counter of the table
+above. That happens when connections reach nginx through
+a proxy: Docker's own, for IPv6 clients of a Docker network without IPv6,
+or one placed in front of nginx. In the second case give nginx the real
+address with its realip module (`set_real_ip_from <the proxy>;` and
+`real_ip_header …;` in `nginx.conf`), so that `$remote_addr` is the client
+again; do not make web read a forwarded header.
+
+This relies on web publishing no port (`docker-compose.yml`): nginx is the
+only way in from outside. Keep it so.
 
 ## 7. Rollback
 
