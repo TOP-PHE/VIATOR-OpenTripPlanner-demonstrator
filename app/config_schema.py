@@ -254,6 +254,14 @@ CONFIG_SCHEMA: dict[str, FieldSpec] = {
     # worker must not loop forever).
     "COVERAGE_MAX_CONCURRENT_RUNS": {"type": "int", "default": 1, "min": 1, "max": 4},
     "COVERAGE_MAX_RESUMES": {"type": "int", "default": 5, "min": 0, "max": 50},
+    # How many pairs in a row of a single-session run may fail on a connection
+    # error, after their retries (5/15/40 s), before the run is stopped and
+    # marked failed: its engine stopped answering (`runner._count_pair_outcome`).
+    # 0 = never stop. Every run also checks, before its pairs, that each engine
+    # it asks answers (no setting). Prompted by 22-24 Nov 2026: eu19's MOTIS
+    # had stopped and a run wrote only error cells, through 7 resumes. Frozen
+    # with the run's other knobs.
+    "COVERAGE_ENGINE_DOWN_PAIRS": {"type": "int", "default": 10, "min": 0, "max": 1000},
     # Day-window defaults (per-run overridable via the create-run form).
     # The string-time format is "HH:MM" 24-hour; "24:00" is special-cased
     # server-side to mean "end of day" so 00:00-24:00 = full day. Per-

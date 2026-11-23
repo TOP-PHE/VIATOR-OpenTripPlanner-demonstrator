@@ -76,6 +76,11 @@ def engine(fresh_db: str, monkeypatch: pytest.MonkeyPatch) -> _FakeMotis:  # noq
         verify_sleep_ms=0,
     )
     monkeypatch.setattr(runner, "_load_coverage_config", lambda _db: cfg)
+
+    async def _engine_answers(_engine: str, _session_id: str) -> bool:
+        return True  # the run's engine check: the fake engine answers
+
+    monkeypatch.setattr(runner, "_engine_answers", _engine_answers)
     monkeypatch.setattr(verify_progress, "FLUSH_EVERY_CELLS", SAVE_EVERY)
     monkeypatch.setattr(verify_progress, "FLUSH_EVERY_S", 999.0)
     return fake

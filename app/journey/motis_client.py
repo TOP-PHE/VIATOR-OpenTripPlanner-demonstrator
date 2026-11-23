@@ -100,6 +100,12 @@ def _base_url_for(session_id: str, base_url: str | None) -> str:
     return f"{_INTERNAL_SCHEME}://motis-{session_id}:8080"
 
 
+def health_url(session_id: str) -> str:
+    """What the coverage runner's engine check asks: GET / of the session's MOTIS,
+    the page its container's own health check asks (`sessions_orchestrator`)."""
+    return f"{_base_url_for(session_id, None)}/"
+
+
 async def fetch_journeys(
     *,
     session_id: str,

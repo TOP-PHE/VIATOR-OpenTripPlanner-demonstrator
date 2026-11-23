@@ -19,6 +19,7 @@ back to OTP — a typo'd engine should be loud, not subtly wrong.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any, Protocol, cast
 
@@ -54,6 +55,8 @@ class _Planner(Protocol):
     """Either `otp_client` or `motis_client`, narrowed to what we use."""
 
     fetch_journeys: _FetchJourneys
+    # The URL the coverage runner's engine check asks: any HTTP answer = the engine runs.
+    health_url: Callable[[str], str]
 
 
 def get_planner(session: SessionRow) -> _Planner:
