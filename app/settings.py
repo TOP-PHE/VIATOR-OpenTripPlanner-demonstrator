@@ -34,6 +34,24 @@ def headroom_gb_or_default(value: Any, default: int, name: str) -> int:
     return default
 
 
+# Default and smallest accepted value of the whole-number build settings.
+_WHOLE_NUMBER_SETTINGS = {
+    "build_min_free_gb": (30, 0),
+    "build_max_hours": (12, 0),
+    "graph_builds_kept": (2, 1),
+}
+
+
+def whole_number_or_default(value: Any, default: int, minimum: int, name: str) -> int:
+    """A whole number not below `minimum` from `value` (int or digits, "30g" read
+    as 30), else `default` (logged): a typo in `.env` must not stop the worker."""
+    number = headroom_gb_or_default(value, default, name)
+    if number >= minimum:
+        return number
+    _log.warning("%s=%r is below %d; using %d", name.upper(), value, minimum, default)
+    return default
+
+
 _TRUE_WORDS = {"true", "1", "yes", "on"}
 _FALSE_WORDS = {"false", "0", "no", "off"}
 
@@ -118,6 +136,20 @@ class Settings(BaseSettings):
     motis_serve_mem_limit: str = ""
     motis_build_mem_limit: str = ""
 
+    # The data disk during a rebuild (app/disk_guard.py). A build does not start
+    # unless the disk has this much free beyond the size of the session's
+    # current build, and the worker stops a running one as soon as the free
+    # space falls under it, so that a build never fills the disk (postgres and
+    # web stop on a full disk). Whole GB; 0 turns both checks off.
+    build_min_free_gb: int = 30
+    # The longest a rebuild job may run, counted from its start, before the
+    # worker stops it (a hung import otherwise runs until someone notices).
+    # Whole hours; 0 = no limit.
+    build_max_hours: int = 12
+    # Complete builds kept per session after a successful one: the build served
+    # and the ones before it, each a rollback point. At least 1.
+    graph_builds_kept: int = 2
+
     # JWT-based auth (step 3+). Web refuses to start on this placeholder, on the
     # one of docker/.env.example and on any secret under 32 bytes
     # (`jwt_secret_problem`, checked in app/main.py `_startup`).
@@ -176,6 +208,13 @@ class Settings(BaseSettings):
         other value is logged and replaced by the field's default.
         """
         return headroom_gb_or_default(value, _HEADROOM_DEFAULTS[info.field_name], info.field_name)
+
+    @field_validator(*_WHOLE_NUMBER_SETTINGS, mode="before")
+    @classmethod
+    def _tolerant_whole_number(cls, value: Any, info: Any) -> Any:
+        """A typo in a build setting must not stop the worker: logged, and the default used."""
+        default, minimum = _WHOLE_NUMBER_SETTINGS[info.field_name]
+        return whole_number_or_default(value, default, minimum, info.field_name)
 
     class Config:
         env_file = ".env"

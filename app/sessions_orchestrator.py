@@ -19,7 +19,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session as DbSession
 
-from . import engine_versions, memory_caps, session_config
+from . import disk_guard, engine_versions, memory_caps, session_config
 from .models import Session as SessionRow
 from .models.sessions import SessionCategory, SessionState
 from .settings import settings
@@ -57,7 +57,7 @@ _OTP_SVC_TEMPLATE = """  otp-{sid}:
       # docker-compose.yml's otp-build service.
       context: ../otp
     restart: unless-stopped
-{memory}    environment:
+{logging}{memory}    environment:
       OTP_MODE: serve
       # Per-session subdirectory under the shared graphs volume — the
       # entrypoint loads $OTP_GRAPH_DIR/current/graph.obj.
@@ -122,7 +122,7 @@ _OTP_SVC_TEMPLATE = """  otp-{sid}:
 _MOTIS_SVC_TEMPLATE = """  motis-{sid}:
     image: {motis_image}
     restart: unless-stopped
-{memory}    user: "0:0"
+{logging}{memory}    user: "0:0"
     volumes:
       # Shared graphs volume — the worker writes per-session MOTIS
       # imported data under graphs/motis/<sid>/current/; this mount
@@ -186,6 +186,16 @@ _MOTIS_SVC_TEMPLATE = """  motis-{sid}:
 
 """
 
+
+# The cap of a router's log, the same as every container's (app/disk_guard.py):
+# the `x-logging` anchor of docker/docker-compose.yml does not reach this file.
+_LOGGING_LINES = (
+    "    logging:\n"
+    "      driver: json-file\n"
+    "      options:\n"
+    f'        max-size: "{disk_guard.CONTAINER_LOG_MAX_SIZE}"\n'
+    f'        max-file: "{disk_guard.CONTAINER_LOG_MAX_FILES}"\n'
+)
 
 # The category is written into a label of the service: only a known one is rendered.
 _CATEGORIES = frozenset(category.value for category in SessionCategory)
@@ -335,6 +345,7 @@ def render_compose(sessions: list[SessionRow]) -> str:
                 _MOTIS_SVC_TEMPLATE.format(
                     sid=s.id,
                     motis_image=engine_versions.MOTIS_IMAGE,
+                    logging=_LOGGING_LINES,
                     memory=_motis_memory_lines(),
                     # MOTIS imports the full year up front; cold-start is
                     # dominated by data-mmap, not query warmup. Reuse the
@@ -355,6 +366,7 @@ def render_compose(sessions: list[SessionRow]) -> str:
                     gc_mode=gc_mode,
                     soft_max_heap=soft_max_heap,
                     # Issue #374: cap derived from that heap, no swap.
+                    logging=_LOGGING_LINES,
                     memory=_otp_memory_lines(heap),
                     # Healthcheck start_period: explicit operator choice if set,
                     # otherwise 300s (5 min) — covers most graphs while keeping
