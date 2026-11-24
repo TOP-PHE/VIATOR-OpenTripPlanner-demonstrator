@@ -2974,6 +2974,53 @@ again; do not make web read a forwarded header.
 This relies on web publishing no port (`docker-compose.yml`): nginx is the
 only way in from outside. Keep it so.
 
+### 6.33 A coverage run ends "failed": the routing engine did not answer, or stopped answering
+
+**Why runs check their engine** (22–24 Nov 2026): eu19's MOTIS had stopped (its
+container could no longer start) while an AT/DE/FR coverage run waited for it.
+The run, resumed 7 times, asked every pair of the stopped engine and wrote only
+error cells: hours of a run, and a matrix that looked like a coverage collapse.
+
+**What a run does now**
+
+- **Before its pairs**, and again at each resume that has pairs left, the run asks
+  each engine it uses (its session's, or every session of a fanout run) the page
+  the engine's container health check asks: MOTIS `/`, OTP `/otp/`. Any HTTP answer
+  counts. Without one, it asks again 20 s later, then 20 s later again, so an engine
+  that is restarting has 40 s to come back. Still nothing: the run ends **failed**
+  without asking a pair, and the page says why:
+  `the routing engine did not answer, so the pairs left were not asked: session
+  eu19-transit-motis (MOTIS) (3 checks over 40 s). …`
+- **During its pairs** (a single-session run): each pair already retries a
+  connection error three times (after 5, 15 and 40 s). When
+  `COVERAGE_ENGINE_DOWN_PAIRS` pairs in a row (default **10**) still fail on a
+  connection error, the run is stopped and ends **failed**:
+  `the routing engine of session … stopped answering: 10 pairs in a row failed on a
+  connection error (ConnectError) after their retries, so the run was stopped …`.
+  The cells asked before stay. An answer, or any other error (a timeout of a slow
+  query), starts the count again. A Stop click still ends the run "cancelled".
+
+`COVERAGE_ENGINE_DOWN_PAIRS` is under Admin → Config → Network coverage matrix,
+frozen with a run's other settings when it starts; 0 turns off the stop during the
+pairs (the check before the pairs stays).
+
+**What to do**
+
+```bash
+cd /opt/viator/docker
+docker compose -p viator ps | grep <session id>                 # Up (healthy)? Exited? Restarting?
+docker compose -p viator logs --tail 100 motis-<session id>     # or otp-<session id>
+```
+
+- **Exited, or restarting again and again**: read its log. A MOTIS that exits at
+  once with `exec "/motis": stat /motis: no such file` while its image is intact
+  has a broken container; create it again:
+  `docker compose -p viator up -d --force-recreate motis-<session id>`, then wait
+  for `(healthy)` (about 4 minutes for eu19).
+- **Up and healthy now**: it was restarting during the run's checks.
+
+Then start a new run: a failed run is not resumed.
+
 ## 7. Rollback
 
 If a deploy breaks production, roll back in under a minute:

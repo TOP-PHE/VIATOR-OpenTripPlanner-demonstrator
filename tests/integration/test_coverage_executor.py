@@ -68,6 +68,11 @@ def engine(fresh_db: str, monkeypatch: pytest.MonkeyPatch) -> _FakeMotis:  # noq
         pair_parallelism=PAIR_PARALLELISM, within_pair_parallelism=WITHIN_PAIR_PARALLELISM
     )
     monkeypatch.setattr(runner, "_load_coverage_config", lambda _db: cfg)
+
+    async def _engine_answers(_engine: str, _session_id: str) -> bool:
+        return True  # the run's engine check: the fake engine answers
+
+    monkeypatch.setattr(runner, "_engine_answers", _engine_answers)
     return fake
 
 
