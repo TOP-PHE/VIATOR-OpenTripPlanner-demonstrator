@@ -28,6 +28,16 @@ from app.network_coverage import executor, runner
 ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.fixture(autouse=True)
+def _engines_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The run's engine check before its pairs asks no real engine here: every engine answers."""
+
+    async def _answers(_engine: str, _session_id: str) -> bool:
+        return True
+
+    monkeypatch.setattr(runner, "_engine_answers", _answers)
+
+
 # ───────────────────────────── worker: start and SIGTERM ─────────────────────────────
 
 

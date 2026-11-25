@@ -125,6 +125,12 @@ def _otp_base(session_id: str) -> str:
     return f"http://otp-{session_id}:8080"
 
 
+def health_url(session_id: str) -> str:
+    """What the coverage runner's engine check asks: GET /otp/ of the session's OTP,
+    the page its container's own health check asks (`sessions_orchestrator`)."""
+    return f"{_otp_base(session_id)}/otp/"
+
+
 def _location_not_found(raw: dict[str, Any]) -> bool:
     """True iff OTP returned no itineraries AND a `LOCATION_NOT_FOUND`
     routing error.

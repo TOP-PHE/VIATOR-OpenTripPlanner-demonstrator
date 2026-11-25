@@ -38,6 +38,16 @@ from app.network_coverage import runner
 # ─────────────────────── shared fixtures ───────────────────────
 
 
+@pytest.fixture(autouse=True)
+def _engines_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The run's engine check before its pairs asks no real engine here: every engine answers."""
+
+    async def _answers(_engine: str, _session_id: str) -> bool:
+        return True
+
+    monkeypatch.setattr(runner, "_engine_answers", _answers)
+
+
 def _fake_actor():
     a = MagicMock()
     a.id = uuid.uuid4()

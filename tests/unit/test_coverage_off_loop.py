@@ -30,6 +30,17 @@ from app.network_coverage import runner
 from app.network_coverage.hubs import Hub
 from tests.unit.canonical_fixtures import journey_from_legs
 
+
+@pytest.fixture(autouse=True)
+def _engines_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The run's engine check before its pairs asks no real engine here: every engine answers."""
+
+    async def _answers(_engine: str, _session_id: str) -> bool:
+        return True
+
+    monkeypatch.setattr(runner, "_engine_answers", _answers)
+
+
 ORIGIN = Hub(id="zz-a", name="ZZ A", short="ZZA", region="", lat=45.99, lon=9.99)
 DEST = Hub(id="zz-b", name="ZZ B", short="ZZB", region="", lat=46.99, lon=10.99)
 DEPART = datetime(2099, 9, 9, 9, 0, tzinfo=UTC)
