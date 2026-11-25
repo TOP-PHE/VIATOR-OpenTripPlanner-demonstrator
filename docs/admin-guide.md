@@ -752,8 +752,9 @@ sudo du -sh /var/lib/docker/volumes/viator_*
 **The planners' public paths need a signed-in session.** `/otp/<sid>/` and
 `/motis/<sid>/` are served to signed-in users only, whatever their role: OTP
 and MOTIS have no authentication of their own, so nginx asks web first
-(`auth_request` on `/api/auth/proxy-validate`, as for `/grafana/` and
-`/prometheus/`). A request without a valid session is sent to `/login`. From
+(`auth_request` on `/api/auth/proxy-validate`; `/grafana/` and
+`/prometheus/` ask the administrators' endpoint instead, §5.5). A request
+without a valid session is sent to `/login`. From
 a terminal, either ask the planner inside its container, as above, or send
 your session: `-b "viator_jwt=$VIATOR_JWT"`, where `VIATOR_JWT` holds the
 value of your browser's `viator_jwt` cookie. The journey API and the coverage
@@ -972,8 +973,11 @@ location /metrics {
 
 `docker-compose.yml` ships **`prometheus`** and **`grafana`** services;
 both are reverse-proxied through nginx with VIATOR's JWT cookie as the
-auth gate. There's no second login — opening `/grafana/` after signing
-into the admin UI just works.
+auth gate, **for platform administrators only**. There's no second login —
+opening `/grafana/` after signing into the admin UI just works for an
+administrator. Any other role gets nginx's "403 Forbidden" page: Grafana
+shows the logs of every container (web, worker, PostgreSQL, nginx with
+its client addresses, the station module), the traces and the metrics.
 
 **How to use:**
 - `https://<host>/grafana/` — dashboards. Pre-provisioned starter
@@ -983,13 +987,21 @@ into the admin UI just works.
 
 **SSO mechanism:**
 - nginx's `/grafana/` and `/prometheus/` locations use `auth_request`
-  to call back to `/api/auth/proxy-validate` (an internal-only endpoint).
-- That endpoint re-uses the standard `current_user_jwt` dependency —
-  same logic as `/api/auth/me`, just with the user identity emitted as
-  response headers (`X-Forwarded-User`, `X-Forwarded-Role`).
+  to call back to `/api/auth/proxy-validate-admin` (an internal-only
+  endpoint).
+- That endpoint accepts a platform administrator's session only
+  (`require_platform_admin`): 403 for another role, 401 without a
+  session, else 200 with the user identity emitted as response headers
+  (`X-Forwarded-User`, `X-Forwarded-Role`). Its twin
+  `/api/auth/proxy-validate` answers every signed-in role and serves
+  other locations (the planners' paths, §5.4; the station mapping
+  module's, §11): leave it as it is.
 - nginx forwards those as `X-WEBAUTH-USER` to Grafana, which auto-creates
-  users on first sight (Editor role by default; manually upgrade to
-  Admin in Grafana's user management for power users).
+  users on first sight, with Grafana's Admin role (only platform
+  administrators get this far).
+- nginx does not pass the browser's or a script's `Authorization` header
+  on to Grafana or Prometheus: a Grafana API token sent through
+  `/grafana/` is not seen by Grafana.
 - 401 from the auth-request bounces the operator to `/login?next=...`
   so the round-trip lands them back at the dashboard after sign-in, but
   only when the requested address has no query string. A deep link that
@@ -999,6 +1011,30 @@ into the admin UI just works.
   others) and must open the dashboard again. A platform administrator
   can use the "Admin dashboard" menu: its links carry no query string,
   so they are followed after sign-in; other roles have no such menu.
+
+**Grafana's own logins are switched off.** The header above is the only
+way in. `docker-compose.yml` sets, beside the login form already disabled:
+
+- `GF_AUTH_BASIC_ENABLED=false`: Grafana accepts no login and password in
+  an `Authorization: Basic` header.
+- `GF_SECURITY_DISABLE_INITIAL_ADMIN_CREATION=true`: a new install does not
+  create Grafana's built-in `admin` account. Nobody uses it: a platform
+  administrator has the Admin role of Grafana's organisation, which
+  covers dashboards, Explore and alerting.
+
+*On an install made before these two settings*, the built-in `admin`
+account is still in the `grafana-data` volume. It can no longer sign in,
+but replace its password once, after the deploy, with one nobody keeps:
+
+```bash
+cd /opt/viator/docker
+openssl rand -base64 32 | docker compose -p viator exec -T grafana \
+  grafana cli admin reset-admin-password --password-from-stdin
+```
+
+The Grafana accounts created earlier for VIATOR users who are not
+administrators stay in that volume too; they are harmless (those people
+no longer reach Grafana).
 
 **Tunables (in `.env`):**
 
@@ -1053,6 +1089,7 @@ Symptoms and fixes:
 | `/grafana/` 502 Bad Gateway | Grafana container isn't running or just restarted | `docker compose ps grafana` — if not Up, check `docker compose logs grafana`. Often nginx caches the dead IP for ~10s after recreate |
 | Grafana logs show `uname=patrick.heuguet@trackonpath.com` but you still see login | Grafana's auto-sign-up failed on a stale user record | Inside Grafana: Administration → Users → delete the half-created row; re-visit `/grafana/` to recreate clean |
 | `/grafana/` works the first time, then breaks after redeploy | Same as the second row — recreate Grafana | `docker compose up -d --force-recreate grafana` |
+| `/grafana/` or `/prometheus/` shows nginx's "403 Forbidden" | The session is not a platform administrator's | Expected for a content manager or an end user. For an administrator: `/api/auth/me` shows the role of the session; a role changed in VIATOR applies at the next sign-in |
 
 The `--force-recreate grafana` is the standard hammer. Doesn't lose any data — UI-edited dashboards, datasource configs, and user list all live in the `grafana-data` volume, which persists across recreations.
 
@@ -1072,7 +1109,7 @@ Three things to watch as you onboard more sessions:
 | Watermark | Why it matters | When to act |
 |---|---|---|
 | `viator_pgdata` size | Search history grows; audit log grows | At 50% disk free, set up retention pruning more aggressively (Admin → Configuration) |
-| `viator_graphs-<sid>` count | Each `serving` session keeps `current` + 2 historical graphs | At 80% disk free, drop unused sessions (Admin → Sessions → Delete) |
+| `viator_graphs-<sid>` count | After a successful build each session keeps `GRAPH_BUILDS_KEPT` complete builds (default 2: the one served and one rollback point); a Europe-wide MOTIS build is about 57 GB | At 80% disk free, drop unused sessions (Admin → Sessions → Delete) |
 | Free RAM during a build | OTP build needs `OTP_BUILD_HEAP + ~4 GB` headroom | If a build OOMs, raise `OTP_BUILD_MEM_LIMIT` (≥ heap + 4) OR upgrade VPS RAM. France-wide builds need 32 GB minimum. |
 | Serve working sets | Since #374 each OTP serve container has a cap (serve heap + headroom, §5.8). A cap is a ceiling, not a reservation: a router uses what its graph needs, usually well under its cap | Size the host on the typical working sets ("Container memory" panel, a few days) of the serving sessions plus the largest build cap, with a margin; not on the sum of the caps. "Swap by container" shows who swaps |
 
@@ -1090,9 +1127,40 @@ space each session takes (graphs, feeds and OSM), and a list of what can be dele
 
 The build a session serves (`current`), live feeds and OSM files, and everything of a session whose
 rebuild is running are never listed. Deletion re-checks each item first and is recorded in the audit
-log (`storage.cleanup`). Docker images are not covered: on the host, `docker image prune` or remove
-old `viator-web` / `viator-otp` tags. Since PR #283 a failed build deletes its own folder; before it,
-failed Europe imports filled the disk on 2026-10-01 and took the site down.
+log (`storage.cleanup`). Docker images are not listed: each deploy removes the images no container
+uses that are older than 14 days (`bin/viator-deploy.sh`); on the host, `docker image prune -a`
+removes every unused one. Since PR #283 a failed build deletes its own folder; before it, failed
+Europe imports filled the disk on 2026-10-01 and took the site down.
+
+A rebuild marked *running* for hours keeps its session out of this list. If no `viator-build-<job>`
+container is running on the host (`docker ps --filter name=^viator-build-`), restart the worker
+(`docker compose -p viator restart worker`): it marks such a job failed at start-up, and the page
+lists the session's builds again.
+
+#### The disk during a rebuild
+
+A full data disk takes the whole site down: postgres can no longer write, web stops answering, and
+a deploy stops half way. On 2026-11-23 a MOTIS import of the Europe session hung for 20 hours and
+held about 240 GB when it was stopped, for a graph that is about 57 GB once built. The worker now
+guards the disk itself (`app/disk_guard.py`), with three settings of `docker/.env`, read by the
+worker:
+
+| Setting | Default | Effect |
+|---|---|---|
+| `BUILD_MIN_FREE_GB` | `30` | A rebuild does not start unless the disk has this much free beyond the size of the session's current build. A running rebuild is stopped as soon as the free space falls under it. `0` turns both checks off. |
+| `BUILD_MAX_HOURS` | `12` | A rebuild still running this many hours after it started (waits for the station module included) is stopped. `0` = no limit. |
+| `GRAPH_BUILDS_KEPT` | `2` | Complete builds kept per session after a successful build. `3` was the fixed number before. |
+
+A rebuild stopped this way ends `failed`, its incomplete folder is deleted, and the served build is
+untouched; its log ends with `[viator] stopped by the worker: …` or begins with `[viator] not
+started: …`, saying which limit and how much was free. Free space (Admin → Storage) and run it
+again; raise `BUILD_MAX_HOURS` only if a sound build really takes longer. The settings are read
+when the worker starts: `docker compose -p viator up -d worker` after editing `.env`.
+
+Every container's log is capped to 3 files of 50 MB: the services of `docker-compose.yml`, the
+per-session routers and the build containers. A deploy first checks that the disk of
+`/opt/viator` and of `/var/lib/docker` has 10 GB free, and stops with exit code 6 before changing
+anything otherwise.
 
 ### 5.7 Watching a refresh (issue #359)
 
@@ -2887,6 +2955,102 @@ The pages show the same as before. If a page of a large run is still slow, look 
 log's request time for `/share/coverage/` and the rows of the run
 (`SELECT count(*) FROM network_coverage_results WHERE run_id = '<id>'`): the page grows with
 the number of cells, not with their journeys.
+
+### 6.32 Sign-in answers 429 "Rate limit exceeded": the limits, and whose address they count
+
+A few routes count their requests and answer **429** over a limit. Every
+counter is kept **per client address**: the address of the connection
+nginx accepted, which nginx hands to web in `X-Real-IP`. A client cannot
+choose it (web does not read `X-Forwarded-For`), and the same address is
+the `actor_ip` written in the audit events.
+
+| Route | Limit |
+|---|---|
+| Sign-in (`POST /api/auth/login`) | 10 per 15 minutes for one account from one address, and 20 per 15 minutes for one address, all accounts together |
+| Registration request, password-reset request | 5 per hour per address, each |
+| Registration confirmation, password-reset confirmation | 10 per hour per address, each |
+| First administrator (`bootstrap-platform-user`) | 3 per hour per address |
+| Share link of a coverage run, its cell details | 60 and 120 per minute per address |
+
+What follows for the people who sign in:
+
+- Someone who mistypes a password ten times waits for the end of the
+  quarter of an hour (it starts at the first attempt). The others behind
+  the same address (an office) are not affected by that account, and its
+  owner is not refused from another address.
+- Twenty attempts from one address on several accounts close sign-in to
+  everybody behind that address for the rest of the quarter of an hour.
+  People already signed in keep their session.
+- The counters live in web's memory: `docker compose -p viator restart web`
+  clears them all (and nothing else: sessions survive a restart).
+
+**Check, after a deploy that touches nginx or the network, that nginx sees
+the clients' own addresses.** The first field of an access-log line is
+that address:
+
+```bash
+docker compose -p viator logs --tail 50 nginx
+```
+
+It must be the public address of whoever made the request. If every line
+starts with an address of the Docker network (`172.…`), all those clients
+are one client for the limits: they share every counter of the table
+above. That happens when connections reach nginx through
+a proxy: Docker's own, for IPv6 clients of a Docker network without IPv6,
+or one placed in front of nginx. In the second case give nginx the real
+address with its realip module (`set_real_ip_from <the proxy>;` and
+`real_ip_header …;` in `nginx.conf`), so that `$remote_addr` is the client
+again; do not make web read a forwarded header.
+
+This relies on web publishing no port (`docker-compose.yml`): nginx is the
+only way in from outside. Keep it so.
+
+### 6.33 A coverage run ends "failed": the routing engine did not answer, or stopped answering
+
+**Why runs check their engine** (22–24 Nov 2026): eu19's MOTIS had stopped (its
+container could no longer start) while an AT/DE/FR coverage run waited for it.
+The run, resumed 7 times, asked every pair of the stopped engine and wrote only
+error cells: hours of a run, and a matrix that looked like a coverage collapse.
+
+**What a run does now**
+
+- **Before its pairs**, and again at each resume that has pairs left, the run asks
+  each engine it uses (its session's, or every session of a fanout run) the page
+  the engine's container health check asks: MOTIS `/`, OTP `/otp/`. Any HTTP answer
+  counts. Without one, it asks again 20 s later, then 20 s later again, so an engine
+  that is restarting has 40 s to come back. Still nothing: the run ends **failed**
+  without asking a pair, and the page says why:
+  `the routing engine did not answer, so the pairs left were not asked: session
+  eu19-transit-motis (MOTIS) (3 checks over 40 s). …`
+- **During its pairs** (a single-session run): each pair already retries a
+  connection error three times (after 5, 15 and 40 s). When
+  `COVERAGE_ENGINE_DOWN_PAIRS` pairs in a row (default **10**) still fail on a
+  connection error, the run is stopped and ends **failed**:
+  `the routing engine of session … stopped answering: 10 pairs in a row failed on a
+  connection error (ConnectError) after their retries, so the run was stopped …`.
+  The cells asked before stay. An answer, or any other error (a timeout of a slow
+  query), starts the count again. A Stop click still ends the run "cancelled".
+
+`COVERAGE_ENGINE_DOWN_PAIRS` is under Admin → Config → Network coverage matrix,
+frozen with a run's other settings when it starts; 0 turns off the stop during the
+pairs (the check before the pairs stays).
+
+**What to do**
+
+```bash
+cd /opt/viator/docker
+docker compose -p viator ps | grep <session id>                 # Up (healthy)? Exited? Restarting?
+docker compose -p viator logs --tail 100 motis-<session id>     # or otp-<session id>
+```
+
+- **Exited, or restarting again and again**: read its log. A MOTIS that exits at
+  once with `exec "/motis": stat /motis: no such file` while its image is intact
+  has a broken container; create it again:
+  `docker compose -p viator up -d --force-recreate motis-<session id>`, then wait
+  for `(healthy)` (about 4 minutes for eu19).
+- **Up and healthy now**: it was restarting during the run's checks.
+
+Then start a new run: a failed run is not resumed.
 
 ## 7. Rollback
 

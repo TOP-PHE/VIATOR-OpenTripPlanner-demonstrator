@@ -176,12 +176,13 @@ Token: 32-byte URL-safe random (`secrets.token_urlsafe(32)`), stored hashed (sha
 
 | Endpoint | Limit |
 |---|---|
-| `POST /api/auth/login` | 20 / 15 min / IP |
+| `POST /api/auth/login` | 10 / 15 min / IP and account, and 20 / 15 min / IP |
 | `POST /api/auth/register-request` | 5 / hour / IP |
 | `POST /api/auth/password-reset-request` | 5 / hour / IP |
 | `POST /api/auth/register-confirm` | 10 / hour / IP |
 
-Hits beyond the limit return `429 Too Many Requests`.
+Hits beyond the limit return `429 Too Many Requests`. The IP is the address of the connection nginx
+accepted (`X-Real-IP`), never a forwarded header the client can write (admin-guide §6.32).
 
 ### 3.6 Audit
 

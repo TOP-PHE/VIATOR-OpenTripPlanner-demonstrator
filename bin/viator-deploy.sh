@@ -36,6 +36,25 @@ echo "VIATOR deploy — $VERSION"
 echo "started at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "$SEPARATOR"
 
+# ─────────────────────────────── Free disk ────────────────────────────────────
+# A deploy writes git objects and pulls images. On a full disk it stops half
+# way, at `git pull` with "No space left on device", which says nothing of the
+# cause or the remedy; and a full disk has usually stopped postgres and web
+# already. Refuse up front, before anything changes. Both paths: the checkout
+# and the images may sit on different disks.
+DEPLOY_MIN_FREE_GB=10
+for path in /opt/viator /var/lib/docker; do
+    # `|| true`: a path df cannot read is not checked, rather than ending the
+    # script here under `set -e`.
+    free_kb=$(df -Pk "$path" 2>/dev/null | awk 'NR == 2 { print $4 }' || true)
+    if [[ "$free_kb" =~ ^[0-9]+$ ]] && (( free_kb < DEPLOY_MIN_FREE_GB * 1024 * 1024 )); then
+        echo "ERROR: only $(( free_kb / 1024 / 1024 )) GB free on the disk of $path;" \
+             "a deploy needs ${DEPLOY_MIN_FREE_GB} GB." >&2
+        echo "       Nothing was changed. Free space first (admin-guide §5.6), then deploy again." >&2
+        exit 6
+    fi
+done
+
 # ─────────────────────────────── Update working tree ──────────────────────────
 cd /opt/viator
 
@@ -262,6 +281,21 @@ if [[ -n "$db_sessions" && "$db_sessions" != "[]" ]]; then
         fi
     done < <(echo "$db_sessions" | tr ',' '\n')
 fi
+
+# ─── Remove old images no container uses ───────────────────────────────────────
+# Every release leaves its web and OTP images behind, and nothing removed them:
+# about 30 GB had built up by 2026-11-23. Removed here: images no container
+# uses (running or stopped) that are older than 14 days, so the images of the
+# last releases stay for a rollback. Whatever is removed is pulled again from
+# its registry when needed. Advisory: a failure warns, the deploy is done.
+echo ">>> remove images no container uses, older than 14 days"
+if prune_out=$(docker image prune --all --force --filter "until=336h" 2>&1); then
+    tail -n 1 <<<"$prune_out"
+else
+    echo "WARNING: the image prune failed (the deploy itself is complete):" >&2
+    tail -n 3 <<<"$prune_out" >&2
+fi
+echo ""
 
 echo "$SEPARATOR"
 echo "DEPLOY OK — $VERSION live on $(hostname)"

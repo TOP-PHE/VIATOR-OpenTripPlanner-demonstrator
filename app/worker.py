@@ -29,7 +29,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -38,6 +38,7 @@ from sqlalchemy import func, update
 
 from . import (
     country_gate,
+    disk_guard,
     engine_versions,
     graph_snapshots,
     gtfs_motis_clean,
@@ -506,8 +507,9 @@ def tick() -> None:
                 engine = getattr(row, "engine", "otp") or "otp"
     container = _build_container_name(job_id)
     done = threading.Event()
+    guard = _Guard()
     watcher = threading.Thread(
-        target=_watch_for_cancel, args=(job_id, container, done), daemon=True
+        target=_watch_for_cancel, args=(job_id, container, done, guard), daemon=True
     )
     watcher.start()
     try:
@@ -531,6 +533,8 @@ def tick() -> None:
             _CANCELLED_WHILE_SENDING,
         ):
             output += "\n[viator] cancelled by an operator: build container stopped\n"
+        if guard.reason is not None and not success:
+            output += f"\n[viator] stopped by the worker: {guard.reason}\n"
         job.log = (job.log or "") + output[-32_000:]
         job.graph_path = graph_path
 
@@ -623,11 +627,27 @@ def _run_engine_build(
     if engine == "motis" and _waiting_cancelled(job_id):
         return _CANCELLED_WHILE_WAITING, False, ""
     _note_country_warning(job_id, session_id)
+    refusal = _disk_refusal(engine, session_id)
+    if refusal is not None:
+        log.error("rebuild job %s not started: %s", job_id, refusal)
+        return f"[viator] not started: {refusal}\n", False, ""
     if engine == "motis":
         return run_build_motis(
             session_id=session_id, max_memory=max_memory, container_name=container
         )
     return run_build(session_id=session_id, max_memory=max_memory, container_name=container)
+
+
+def _disk_refusal(engine: str, session_id: str | None) -> str | None:
+    """Why the build must not start for want of free disk (`disk_guard.start_refusal`)."""
+    graph_dir = Path(str(settings.graph_dir))
+    if session_id is None:
+        session_root = graph_dir
+    elif engine == "motis":
+        session_root = graph_dir / "motis" / session_id
+    else:
+        session_root = graph_dir / session_id
+    return disk_guard.start_refusal(graph_dir, session_root, settings.build_min_free_gb)
 
 
 def _sending_cancelled(job_id: uuid.UUID, session_id: str) -> bool:
@@ -777,13 +797,44 @@ def _kill_container(name: str) -> None:
     )
 
 
-def _watch_for_cancel(job_id: uuid.UUID, container: str, done: threading.Event) -> None:
-    """Runs beside a build. Once the job is cancelled, kill its container on
-    every poll: MOTIS runs `config` then `import` under the same name, and a
-    container started after the first kill must not survive either."""
+@dataclass
+class _Guard:
+    """What stopped a rebuild other than an operator: set once by the watcher,
+    then written into the job's log by `tick()`."""
+
+    started: float = field(default_factory=time.monotonic)
+    reason: str | None = None
+
+
+def _guard_stops(guard: _Guard, job_id: uuid.UUID, container: str) -> bool:
+    """True once the rebuild must stop for the disk or its duration
+    (`disk_guard.stop_reason`); its container is then killed on every poll."""
+    if guard.reason is None:
+        guard.reason = disk_guard.stop_reason(
+            Path(str(settings.graph_dir)),
+            settings.build_min_free_gb,
+            time.monotonic() - guard.started,
+            settings.build_max_hours,
+        )
+        if guard.reason is None:
+            return False
+        log.error("rebuild job %s stopped: %s", job_id, guard.reason)
+    _kill_container(container)
+    return True
+
+
+def _watch_for_cancel(
+    job_id: uuid.UUID, container: str, done: threading.Event, guard: _Guard | None = None
+) -> None:
+    """Runs beside a build. Once the job is cancelled, or `guard` says it must
+    stop, kill its container on every poll: MOTIS runs `config` then `import`
+    under the same name, and a container started after the first kill must not
+    survive either."""
     seen = False
     while not done.wait(_CANCEL_POLL_SECONDS):
         try:
+            if guard is not None and _guard_stops(guard, job_id, container):
+                continue
             if not _cancel_requested(job_id):
                 continue
             if not seen:
@@ -1456,7 +1507,7 @@ def run_build(
         # any container that mounts the volume.
         current.symlink_to(graph_target.name, target_is_directory=True)
 
-        _prune_old_graphs(sid, keep=3)
+        _prune_old_graphs(sid, keep=settings.graph_builds_kept)
 
         succeeded = True
         return output, True, str(graph_target)
@@ -1668,6 +1719,8 @@ def run_build_motis(
             # Issue #374: if the HOST runs out of memory, the kernel kills a
             # build first rather than a serving router or postgres.
             *memory_caps.BUILD_OOM_SCORE_ARGS,
+            # The container's own log is capped like every other container's.
+            *disk_guard.DOCKER_RUN_LOG_ARGS,
             "--user",
             worker_user,
             "--network",
@@ -1846,7 +1899,7 @@ def run_build_motis(
         # (volume mount paths differ between worker and serve containers).
         current.symlink_to(staging.name, target_is_directory=True)
 
-        _prune_old_motis_imports(sid, keep=3)
+        _prune_old_motis_imports(sid, keep=settings.graph_builds_kept)
 
         succeeded = True
         return output, True, str(staging)
@@ -1861,7 +1914,7 @@ def run_build_motis(
 def _discard_failed_build(build_dir: Path) -> None:
     """Delete the folder a failed build wrote into.
 
-    Success prunes old builds (`keep=3`), but nothing ever removed a *failed*
+    Success prunes old builds (`GRAPH_BUILDS_KEPT`), but nothing ever removed a *failed*
     build's folder, and a failed Europe-wide MOTIS import leaves tens of GB of
     partial street and timetable data behind. On 2026-10-01 about fifteen of
     them filled the 678 GB disk and took the site down (web, postgres). The
