@@ -508,7 +508,7 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   characters, ≤500 items a list, texts ≤200 characters; over a row/size/line/cell limit nothing is
   written; over the item and text limits the value is dropped or the label cut, counted in `dropped`.
 - **Isolation**: `ensure_extract` runs the extraction in a spawned child (`RLIMIT_AS` 2 GiB,
-  `RLIMIT_CPU` 40 min, 45 min wall clock, `nice 10`, `PR_SET_PDEATHSIG` so it dies with its parent),
+  `RLIMIT_CPU` 3 h, 4 h wall clock (40 and 45 min before 25 November 2026), `nice 10`, `PR_SET_PDEATHSIG` so it dies with its parent),
   one at a time on the machine (`flock` on
   `inbox/.station-extract.lock`); a child that passes a limit ends with the word of that limit:
   `memory_limit` (a `MemoryError`, expat's "out of memory" included), `cpu_limit` (killed by SIGXCPU)
@@ -538,8 +538,9 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   calendars, links, …; `app/station_extract_skip.py`), and the GTFS reader reads `stop_times.txt` by
   column position: a NeTEx of 4 GB unpacked with 200,000 StopPlaces in 67 s (about 60 MB/s; before,
   304 s), peak RSS 198 MiB; a GTFS of 40 million stop times in 57 s (before, 127 s), peak RSS
-  100 MiB. A national NeTEx of 2 GB zipped (~40 GB unpacked) takes about 11 minutes, so
-  `RLIMIT_CPU` is 40 minutes (twice an archive packing 30 times, on a slower core).
+  100 MiB. Real national exports read slower: on 25 November 2026 SBB's NeTEx (39.7 GB unpacked) and
+  DB's (77.9 GB) each used the then 40 minutes, so under 16.5 and 32.5 MB/s; `RLIMIT_CPU` is
+  3 hours since (DB down to 7 MB/s, SBB down to 4 MB/s), the wall clock 4 hours.
 - **NeTEx memory model** (production, 15 October: two national NeTEx archives stopped at the memory
   limit): what the reader keeps grows with the network, never with the journeys or their passing
   times, and every structure is capped. Pass 1 keeps the Lines and Routes, each distinct journey

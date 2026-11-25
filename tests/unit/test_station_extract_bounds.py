@@ -31,7 +31,7 @@ from typing import Any
 
 import pytest
 
-from app import feed_fetch, station_extract, station_extract_common
+from app import feed_fetch, station_extract, station_extract_common, station_extract_upload
 from app import station_extract_gtfs as gtfs
 from app import station_extract_netex as netex
 from app.station_extract import ExtractError, build_extract, ensure_extract, feed_key_for
@@ -558,9 +558,29 @@ def test_child_limits_are_set(monkeypatch: pytest.MonkeyPatch) -> None:
         ("nice", 10),
     ]
     assert station_extract.CHILD_MEMORY_BYTES == 2 * 1024 * MIB
-    assert station_extract.CHILD_CPU_SECONDS == 40 * 60
-    assert station_extract.CHILD_WALL_SECONDS == 45 * 60
+    assert station_extract.CHILD_CPU_SECONDS == 180 * 60
+    assert station_extract.CHILD_WALL_SECONDS == 240 * 60
     assert station_extract.CHILD_NICE == 10
+
+
+def test_the_national_exports_of_25_november_fit_the_processor_time() -> None:
+    """Production, 25 November 2026: SBB's NeTEx (39.7 GB unpacked) and DB's
+    (77.9 GB) each used the 40 minutes of processor time, a child alone on a
+    core, so they read under 16.5 and 32.5 MB/s. The time now reads each of
+    them at half that pace, and a niced child on a busy server keeps an hour
+    of wall clock beyond it."""
+    for unpacked, pace in ((39.7e9, 16.5e6), (77.9e9, 32.5e6)):
+        assert unpacked / (pace / 2) <= station_extract.CHILD_CPU_SECONDS
+    assert station_extract.CHILD_WALL_SECONDS - station_extract.CHILD_CPU_SECONDS >= 3600
+    assert station_extract.WAIT_SECONDS > station_extract.CHILD_WALL_SECONDS
+
+
+def test_a_refresh_pass_waits_for_two_national_exports() -> None:
+    """A refresh's pass waits for every feed, one extraction at a time, under
+    its ceiling: two national exports at their wall clock and an hour of
+    every other feed fit in it."""
+    two_national = 2 * station_extract.CHILD_WALL_SECONDS
+    assert two_national + 3600 <= station_extract_upload.REFRESH_BUDGET_SECONDS
 
 
 def test_the_child_asks_to_be_killed_first(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

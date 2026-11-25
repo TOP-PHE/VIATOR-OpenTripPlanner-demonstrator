@@ -1293,7 +1293,8 @@ def test_a_wall_clock_stop_is_remembered_the_second_time(
 ) -> None:
     """Review of #358: a niced child on a busy server may stop at its wall
     clock before its processor time; tried once more, then remembered, so a
-    national archive does not hold the machine 45 minutes at every pass."""
+    national archive does not hold the machine its whole wall clock at every
+    pass."""
     wall = ExtractError("wall_clock_limit", station_extract.WALL_CLOCK)
     child = _Child(wall)
     monkeypatch.setattr(station_extract, "_run_child", child)
