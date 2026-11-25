@@ -1,5 +1,15 @@
 name: viator
 
+# Every container's log is capped: 3 files of 50 MB (app/disk_guard.py, which
+# caps the build containers and the per-session routers the same way). The
+# json-file driver otherwise keeps a container's whole output for as long as
+# the container lives.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
 # Per-session OTP services live in a separate file written by
 # `app/sessions_orchestrator.py` whenever a session reaches state='serving'.
 # The included file ships as an empty stub (services: {}) so first
@@ -10,6 +20,7 @@ include:
 services:
   nginx:
     image: nginx:1.27-alpine
+    logging: *logging
     restart: unless-stopped
     ports:
       - "80:80"
@@ -50,6 +61,7 @@ services:
   # itself on its own healthcheck bounce is a classic self-heal loop.
   autoheal:
     image: willfarrell/autoheal:1.2.0
+    logging: *logging
     restart: unless-stopped
     environment:
       # Opt-in mode: only touch containers carrying the label below set to
@@ -74,6 +86,7 @@ services:
     # dev and for VPSes that prefer building over pulling. `VIATOR_VERSION`
     # picks the tag — set to `v0.1.0`, `latest`, etc. via .env.
     image: ghcr.io/top-phe/viator-web:${VIATOR_VERSION:-latest}
+    logging: *logging
     build:
       context: ..               # repo root (so app/ and requirements.txt are visible)
       dockerfile: docker/web/Dockerfile
@@ -161,6 +174,7 @@ services:
 
   worker:
     image: ghcr.io/top-phe/viator-web:${VIATOR_VERSION:-latest}
+    logging: *logging
     build:
       context: ..
       dockerfile: docker/web/Dockerfile
@@ -200,6 +214,11 @@ services:
       # Issue #374 — cap (with no swap) of the MOTIS build containers the
       # worker starts with `docker run`. Empty = no cap.
       MOTIS_BUILD_MEM_LIMIT: ${MOTIS_BUILD_MEM_LIMIT:-}
+      # The data disk during a rebuild (app/disk_guard.py): free space kept
+      # (GB), longest rebuild (hours, 0 = no limit), complete builds kept per session.
+      BUILD_MIN_FREE_GB: ${BUILD_MIN_FREE_GB:-30}
+      BUILD_MAX_HOURS: ${BUILD_MAX_HOURS:-12}
+      GRAPH_BUILDS_KEPT: ${GRAPH_BUILDS_KEPT:-2}
       JWT_SECRET: ${JWT_SECRET}
       DOCKER_HOST: unix:///var/run/docker.sock
       # Multimodal Station Mapping module: the same two settings as web. Before
@@ -232,6 +251,7 @@ services:
   #     otp-build
   otp-build:
     image: ghcr.io/top-phe/viator-otp:${VIATOR_VERSION:-latest}
+    logging: *logging
     build: ./otp
     profiles: ["build-only"]
     # The build-only profile runs OTP in `--build` mode, which doesn't bind
@@ -275,6 +295,7 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    logging: *logging
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
@@ -292,7 +313,8 @@ services:
   # Prometheus scrapes web:8000/metrics (configured in
   # docker/prometheus/prometheus.yml). Grafana provides dashboards on top.
   # Both are reverse-proxied through nginx with VIATOR's JWT-cookie auth
-  # (single sign-on with the admin UI — no separate Grafana login). See
+  # (single sign-on with the admin UI — no separate Grafana login), for
+  # platform administrators only. See
   # admin-guide §5.5 for operator setup + access patterns.
   #
   # Neither service binds host ports — both reachable only via nginx
@@ -301,6 +323,7 @@ services:
 
   prometheus:
     image: prom/prometheus:v3.0.1
+    logging: *logging
     restart: unless-stopped
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
@@ -345,6 +368,7 @@ services:
     # latest release and carries all three. Images from v0.53.0 on are
     # published on ghcr.io only; gcr.io/cadvisor stops at v0.55.1.
     image: ghcr.io/google/cadvisor:v0.60.6
+    logging: *logging
     restart: unless-stopped
     # cAdvisor needs read access to host paths to enumerate containers and
     # their cgroup stats. `privileged: true` is the standard wiring per
@@ -407,6 +431,7 @@ services:
 
   node-exporter:
     image: prom/node-exporter:v1.8.2
+    logging: *logging
     restart: unless-stopped
     # Sees the host's real PID namespace so its `/proc` reads aren't
     # confined to the container's own processes.
@@ -423,12 +448,14 @@ services:
 
   grafana:
     image: grafana/grafana:11.4.0
+    logging: *logging
     restart: unless-stopped
     environment:
       GF_SERVER_ROOT_URL: ${PUBLIC_BASE_URL:-http://localhost}/grafana/
       GF_SERVER_SERVE_FROM_SUB_PATH: "true"
       # Reverse-proxy auth: nginx authenticates via VIATOR's JWT cookie
-      # (auth_request → /api/auth/proxy-validate) and forwards the user
+      # (auth_request → /api/auth/proxy-validate-admin: platform
+      # administrators only) and forwards the user
       # identity as `X-WEBAUTH-USER`. Grafana trusts the header because
       # the only network path that can reach Grafana is via nginx (no
       # host ports bound, whitelist below pins to docker bridge range).
@@ -474,6 +501,18 @@ services:
       GF_AUTH_ANONYMOUS_ENABLED: "false"
       GF_AUTH_DISABLE_LOGIN_FORM: "true"
       GF_AUTH_DISABLE_SIGNOUT_MENU: "true"
+      # The header is the only way in: Grafana's password logins are off
+      # too. `[auth.basic] enabled` (default true): no login and password
+      # in an `Authorization` header, which nginx does not pass on either
+      # (nginx.conf, `/grafana/`).
+      GF_AUTH_BASIC_ENABLED: "false"
+      # `[security] disable_initial_admin_creation` (default false): a new
+      # install does not create Grafana's built-in `admin` account. Nobody
+      # uses it here: a platform administrator gets the Admin role through
+      # the header. A `grafana-data` volume that already has the account
+      # keeps it: admin-guide §5.5 gives the one command to run on an
+      # install made before this setting.
+      GF_SECURITY_DISABLE_INITIAL_ADMIN_CREATION: "true"
     volumes:
       - grafana-data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
@@ -494,6 +533,7 @@ services:
 
   loki:
     image: grafana/loki:3.3.2
+    logging: *logging
     restart: unless-stopped
     command: ["-config.file=/etc/loki/loki-config.yaml"]
     volumes:
@@ -502,6 +542,7 @@ services:
 
   promtail:
     image: grafana/promtail:3.3.2
+    logging: *logging
     restart: unless-stopped
     command: ["-config.file=/etc/promtail/promtail-config.yaml"]
     volumes:
@@ -529,6 +570,7 @@ services:
 
   tempo:
     image: grafana/tempo:2.6.1
+    logging: *logging
     restart: unless-stopped
     command: ["-config.file=/etc/tempo/tempo-config.yaml"]
     volumes:

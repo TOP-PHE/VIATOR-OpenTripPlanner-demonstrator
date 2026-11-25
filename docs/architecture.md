@@ -76,9 +76,9 @@ Three details in that picture are easy to get backwards and expensive to debug:
   nginx fragments plus a `.reload-trigger` sentinel; the worker picks them up on its next tick.
 - **`web` (and the worker's coverage executor) reach the engine containers directly by DNS**, not through nginx. The nginx
   `/otp/<sid>/` and `/motis/<sid>/` routes exist for the operator's browser, and are served to signed-in
-  sessions only: the engines have no authentication of their own, so each generated `location` carries the
-  `auth_request` of `/grafana/` (`sessions_orchestrator.render_nginx`) and forwards neither the cookie nor a
-  bearer token.
+  sessions only: the engines have no authentication of their own, so each generated `location` carries an
+  `auth_request` on `/api/auth/proxy-validate`, which every signed-in role passes (`sessions_orchestrator.render_nginx`),
+  and forwards neither the cookie nor a bearer token.
 
 ### 2.2 Layers
 
@@ -149,7 +149,7 @@ Three details in that picture are easy to get backwards and expensive to debug:
 5. `worker.py::tick()` (every `WORKER_TICK_SECONDS`, default 15) picks the oldest `rebuild_jobs` row at `status='pending'` whose session has no refresh running (`refresh_progress.running_for`), waits out `REBUILD_DEBOUNCE_SECONDS` (default 1800 — so a burst of feed refreshes produces one build), flips it to `running`.
 6. `tick` re-reads `sessions.engine` in its own short transaction and dispatches to `run_build` or `run_build_motis`. `run_build` resolves every per-session knob (`osm_filter.validate_scope`, `osm_geo.validate_countries`, `otp_timezone.validate_timezone`, `otp_heap.validate_heap`, `otp_api_timeout.validate_timeout`, `ingestion.normalize_providers`), decrypts GTFS-RT credentials via `app/credentials.py`, and renders `router-config.json` with `router_config.render_router_config`.
 7. It shells out: `docker compose -p viator run --rm -e OTP_HEAP=… -e OTP_OSM_SCOPE=… otp-build`, cwd `/srv/docker`, via the mounted docker socket (`_DOCKER = "/usr/local/bin/docker"` — a single constant so every subprocess call is auditable). With `max_memory` set it first stops the observability stack and the serving session containers, and restores them in a `finally`.
-8. On success: move `graph.obj` to `graphs/<sid>/<timestamp>/`, repoint `graphs/<sid>/current` as a **relative** symlink, `_prune_old_graphs(keep=3)`.
+8. On success: move `graph.obj` to `graphs/<sid>/<timestamp>/`, repoint `graphs/<sid>/current` as a **relative** symlink, `_prune_old_graphs(keep=GRAPH_BUILDS_KEPT)`.
 9. Back in `tick`: job → `done`; session auto-advances `populated|configured` → `graph_built`; `graph_snapshots.enumerate_session_inputs` walks the inbox computing sha256 from disk (not just the `Upload` table, which misses refresh-from-URL feeds) and `record_snapshot` writes the `graph_snapshots` row. Snapshot failure never flips a successful build to failed.
 10. Operator clicks Promote → `POST /api/sessions/{sid}/promote`: state → `serving`, `sessions_orchestrator.regenerate(db)` rewrites `docker-compose.sessions.yml` + `nginx-sessions.conf`, and touches `/data/generated/.reload-trigger`.
 11. The worker's next tick runs `handle_reload_trigger()`: `docker compose -p viator up -d` (starts `otp-<sid>` / `motis-<sid>`) and `nginx -s reload`, then deletes the trigger. **Eventually consistent** — there is a ≤15 s window where the DB says `serving` but the container isn't routable yet. `main.py::_startup` also calls `sessions_orchestrator.regenerate` at boot to close the drift window after a deploy.
@@ -164,7 +164,7 @@ Three details in that picture are easy to get backwards and expensive to debug:
 5. First-ever admin: `POST /api/auth/bootstrap-platform-user` (3/hour). Compares `settings.bootstrap_token` with `secrets.compare_digest`, and **403s permanently once any platform_admin exists** — so leaving `BOOTSTRAP_TOKEN` in `.env` is only a defence-in-depth issue, not an open door.
 6. Self-registration: `POST /api/auth/register-request` **always returns 204** (no email enumeration); creates a `VerificationToken` storing only the *hash* while the raw token goes out in the magic link via `auth/email.py::send_verification_email` → `/confirm/<raw>` → `GET /api/auth/check-token` → `POST /api/auth/register-confirm` (10/hour), which creates the `User` at `REGISTRATION_DEFAULT_ROLE` and issues a JWT. Gated by the `REGISTRATION_OPEN` config key.
 7. Password reset mirrors that exactly: `password-reset-request` (5/hour, always 204) → `PasswordResetToken` with 2 h TTL → `/reset/<raw>` → `password-reset-confirm`.
-8. Observability SSO: nginx `auth_request` on `/grafana/` and `/prometheus/` hits `GET /api/auth/proxy-validate`, which returns 200 plus `X-Forwarded-User` / `X-Forwarded-Role` headers. The role is translated by `auth/grafana_role_map.py::viator_role_to_grafana` into Grafana's Admin/Editor/Viewer vocabulary, unknown roles falling back to Viewer. Deliberately separate from `/me` because it's hit at scrape frequency and must not be rate-limited.
+8. Observability SSO, for platform administrators only: nginx `auth_request` on `/grafana/` and `/prometheus/` hits `GET /api/auth/proxy-validate-admin` (`require_platform_admin`), which returns 200 plus `X-Forwarded-User` / `X-Forwarded-Role` headers, 403 for any other role (nginx serves it as it is) and 401 without a session (nginx sends the browser to `/login`). Its twin `GET /api/auth/proxy-validate` answers the same headers to every signed-in role, for the locations that only need a session: the per-session engine routes ask it, and so does the station mapping module's nginx include, which reads `X-Viator-Role` from the answer. The role is translated by `auth/grafana_role_map.py::viator_role_to_grafana` into Grafana's Admin/Editor/Viewer vocabulary, unknown roles falling back to Viewer. Both are deliberately separate from `/me` because they are hit on every proxied request and must not be rate-limited.
 9. **Legacy surface still live:** `security.py::authed` (HTTP basic against `ADMIN_USER`/`ADMIN_PASSWORD`) still guards `/` and `/upload` in `main.py`. When `ADMIN_USER` is empty, `authed_or_none` returns `None` and `/` redirects to `/login` — this exists purely to avoid the browser's native basic-auth popup on a bare-hostname visit to a Phase-2 deployment. The credential exists only when both settings are non-empty: with either one empty, `authed` answers 401 to every request, so `/upload` is closed in Phase-2 mode.
 
 ---
@@ -278,12 +278,13 @@ and is off unless both are set.
 | POST | `/api/auth/register-request` | Always 204 (no email enumeration); 5/hour | anon |
 | GET | `/api/auth/check-token?t=` | Validate magic-link token before the password form | anon |
 | POST | `/api/auth/register-confirm` | Create user, issue JWT; 10/hour | anon |
-| POST | `/api/auth/login` | JWT + httpOnly cookie; 20/15min | anon |
+| POST | `/api/auth/login` | JWT + httpOnly cookie; 10/15min per client address and account, 20/15min per client address | anon |
 | POST | `/api/auth/logout` | Clears cookie (on a *fresh* Response — see trap) | anon |
 | GET | `/api/auth/me` | Current identity | logged-in |
-| GET | `/api/auth/proxy-validate` | nginx `auth_request` for Grafana/Prometheus and the per-session engine routes; identity in headers | logged-in |
+| GET | `/api/auth/proxy-validate` | nginx `auth_request` for the per-session engine routes and the station mapping module's include; identity in headers | logged-in |
 | POST | `/api/auth/password-reset-request` / `-confirm` | Always 204 / 2 h TTL token; 5 and 10 per hour | anon |
 | POST | `/api/auth/bootstrap-platform-user` | First admin only; 403 forever once one exists; 3/hour | token |
+| GET | `/api/auth/proxy-validate-admin` | nginx `auth_request` for Grafana/Prometheus; identity in headers; 403 for any other role | platform_admin |
 | GET | `/login`, `/register`, `/confirm/{t}`, `/reset[/{t}]` | Auth page shells | anon |
 | GET | `/journey`, `/credentials` | Operator pages | redirect if anon |
 | GET | `/admin/users`, `/admin/config`, `/admin/sessions`, `/admin/reports`, `/admin/network-coverage`, `/admin/nap-catalogues` | Admin page shells | redirect if anon, 403 HTML if not admin |
@@ -410,8 +411,15 @@ display model in one place, `app/static/js/canonical_view.js`; no engine payload
   is a trap — cookies set on it are discarded when you return a fresh object.
 - **Generic-204 is deliberate.** `register-request` and `password-reset-request` always return 204 to
   prevent email enumeration; failures are still audit-logged, only the HTTP shape is uniform.
-- **`/api/auth/proxy-validate` is intentionally un-rate-limited** and separate from `/me`: nginx hits
-  it on every Grafana/Prometheus request. Rate-limiting it breaks observability SSO.
+- **`/api/auth/proxy-validate` and `/api/auth/proxy-validate-admin` are intentionally un-rate-limited** and
+  separate from `/me`: nginx hits one of them on every request it proxies behind an `auth_request`.
+  Rate-limiting them breaks observability SSO.
+- **Two validation endpoints, two rules: do not narrow the first.** `/api/auth/proxy-validate` answers every
+  signed-in role and is asked from outside `nginx.conf` (the generated per-session engine routes; the station
+  mapping module's include, which reads `X-Forwarded-User` and `X-Viator-Role` from it);
+  `/api/auth/proxy-validate-admin` answers platform administrators only and gates `/grafana/` and
+  `/prometheus/`. A new location meant for administrators asks the second; restricting the first would close
+  the planners' paths and the module's screens to the roles they serve.
 - **OSM refresh is a separate endpoint on purpose** — bundling it into `/sources/refresh` invalidates
   the streetGraph cache and adds ~30 min to the next build for a GTFS-only change.
 - **Credential and station secrets never round-trip.** `GET /api/credentials` returns `"********"`;
@@ -1029,7 +1037,7 @@ countries with ≥ `SUGGEST_MIN_STOPS` (5).
 
 **Snapshots and promotion.** After a successful build the worker does three separate "promotions".
 (1) *On disk*: `graph.obj` moves to `graphs/<sid>/<timestamp>/`, and `graphs/<sid>/current` is
-repointed as a **relative** symlink (`current -> 20260429-042955`) before `_prune_old_graphs(keep=3)`.
+repointed as a **relative** symlink (`current -> 20260429-042955`) before `_prune_old_graphs(keep=GRAPH_BUILDS_KEPT)`.
 (2) *In the snapshot table*: `enumerate_session_inputs` walks `gtfs/`, `netex/`, `osm/`, streams a
 SHA-256 per file, dedupes by hash, and cross-references the `Upload` table — files with an `Upload`
 row are `source: "uploaded"`, everything else `"refreshed"`. This exists because refresh-from-URL
@@ -1576,7 +1584,7 @@ left alone; dropping a course means dropping the journey meetings that name it, 
 the whole import.
 
 **Promotion.** On success the graph moves to `graphs/<sid>/<timestamp>/`, `current` is
-repointed, and `_prune_old_graphs(keep=3)` runs. Promote (`POST /api/sessions/<sid>/promote`)
+repointed, and `_prune_old_graphs(keep=GRAPH_BUILDS_KEPT)` runs. Promote (`POST /api/sessions/<sid>/promote`)
 sets `serving`, calls `regenerate`, and touches `/data/generated/.reload-trigger`. The worker's
 next `handle_reload_trigger()` runs `docker compose up -d --no-deps <serving services>`, removes
 orphaned OTP services, warns about non-compose containers running the VIATOR OTP image, runs
@@ -1640,6 +1648,15 @@ Heap → cgroup cap derivation (`mem_limit_for_heap` = `heap_gb + max(4, heap_gb
 
 ### Invariants & traps
 
+- **A build must never fill the data disk.** On a full disk postgres and web stop, and the site with
+  them (2026-10-01; 2026-11-23, a hung Europe import holding about 240 GB). `app/disk_guard.py`
+  refuses a build without `BUILD_MIN_FREE_GB` free beyond the session's current build, and the
+  cancel watcher (`_watch_for_cancel`, every 10 s) also asks `disk_guard.stop_reason` and kills
+  the build container under that floor or past `BUILD_MAX_HOURS`, like a cancel; `tick()` writes
+  the reason into the job's log. The import's own output reaches the job log only when it exits:
+  a hung import shows nothing past `/motis import` in the log. A new kind of build container must
+  carry `_build_container_name(job_id)`, or the watcher cannot stop it, and
+  `disk_guard.DOCKER_RUN_LOG_ARGS`, or its log grows without limit.
 - **`graphs/<sid>/current` must be a *relative* symlink.** The volume mounts at different paths
   in the worker (`/data/graphs`) and the serve container (`/var/otp/graph`). An absolute target
   resolves in one namespace only; the serve container dies with "graph.obj: No such file".
@@ -1862,7 +1879,7 @@ seams are drawn where a real product would draw them, so nothing has to be unpic
 | `app/metrics.py` | Prometheus HTTP middleware, four DB-derived gauges, the federated planner's tries counter, `/metrics` |
 | `app/tracing.py` | OpenTelemetry SDK + OTLP→Tempo exporter (behind `RedactingSpanExporter`) + auto-instrumentation (FastAPI, SQLAlchemy, httpx, logging) |
 | `app/url_redaction.py` | The one rule for URLs in logs and spans: query values outside an allow-list and token path segments become `REDACTED` |
-| `app/rate_limit.py` | slowapi `Limiter` with **no default limits**; routes opt in |
+| `app/rate_limit.py` | slowapi `Limiter` with **no default limits**, keyed by client address (`client_key`); routes opt in; `count_login_attempt` keeps sign-in's two counters |
 
 ### How it works
 
@@ -1975,9 +1992,11 @@ defensible at demonstrator RPM.
 | `target_kind` / `target_id` | text | e.g. `platform_config` / `COVERAGE_SLOT_COUNT` |
 | `metadata` | jsonb | mapped as `metadata_` in Python (`metadata` is reserved by SQLAlchemy) |
 
-Rate limits, all on `/api/auth/*` and nowhere else: `register-request` 5/hour,
-`register-confirm` 10/hour, `login` 20/15minute, `password-reset-request` 5/hour,
-`password-reset-confirm` 10/hour, `bootstrap-platform-user` 3/hour.
+Rate limits, each counted per client address (the address nginx saw, `security.client_ip`). On `/api/auth/*`:
+`register-request` 5/hour, `register-confirm` 10/hour, `password-reset-request` 5/hour,
+`password-reset-confirm` 10/hour, `bootstrap-platform-user` 3/hour, and `login` with two counters kept by
+`rate_limit.count_login_attempt` instead of a decorator: 10/15minute per address and account, 20/15minute per
+address. On the public share routes (`/share/coverage/…`): 60 and 120 per minute.
 
 ### Invariants & traps
 
@@ -1990,17 +2009,29 @@ Rate limits, all on `/api/auth/*` and nowhere else: `register-request` 5/hour,
   stored credential becomes undecryptable — the AES key is HKDF-derived from the same secret, and
   there is no backup key. The documented recovery is: delete the affected credentials and have users
   re-enter them. Never change `_HKDF_SALT` or `_HKDF_INFO` for the same reason.
-- **The rate limiter almost certainly buckets every client together.** `slowapi.util.get_remote_address`
-  reads `request.client.host`, uvicorn is started **without** `--proxy-headers`
-  (`docker/web/Dockerfile` CMD), and nginx proxies everything — so `request.client.host` is nginx's
-  container IP. "20 logins per 15 minutes" is therefore a *global* limit, not per-client. Note the
-  asymmetry: `security.client_ip()` reads `X-Forwarded-For` explicitly, so **audit rows record the
-  real client IP while the rate limiter does not**. The `rate_limit.py` docstring claiming
-  `get_remote_address` "respects X-Forwarded-For" does not match slowapi's implementation.
-- **`client_ip()` trusts the first `X-Forwarded-For` entry.** nginx uses `$proxy_add_x_forwarded_for`,
-  which *appends* the real address to whatever the client sent — so the first element is
-  client-controlled and `actor_ip` in the audit log is spoofable. Fine for operational forensics on a
-  trusted operator deployment; do not treat it as evidence.
+- **The client's address is nginx's `X-Real-IP`, and nothing else.** `security.client_ip()` (the `actor_ip` of
+  audit rows) and `rate_limit.client_key` (every limiter counter) read the header nginx writes from
+  `$remote_addr`, and fall back on the connection's own address for a call made inside the Docker network.
+  Neither reads `X-Forwarded-For`, a list the client can start with any value; nginx sends
+  `X-Forwarded-For $remote_addr` too, not `$proxy_add_x_forwarded_for`. uvicorn's `--proxy-headers` and
+  `--forwarded-allow-ips` play no part (`request.client.host` stays nginx's container address). This holds
+  because web publishes no port; a container of the Docker network can still call web with any `X-Real-IP`,
+  and those are trusted. Three ways to break it: a new nginx `location` that reaches web without
+  `proxy_set_header X-Real-IP $remote_addr;` (the client's own header then passes through); a published port
+  on web; a proxy or CDN in front of nginx, which gives every client that proxy's address. For the last one,
+  use nginx's realip module (`set_real_ip_from <that proxy>;` + `real_ip_header`) so that `$remote_addr` is
+  the client again: never read `X-Forwarded-For` in the application.
+- **One counter per address is only as good as the address.** People behind one address (an office, a mobile
+  operator's gateway) share the counters of the decorated routes. If nginx's access log starts every line with
+  an address of the Docker network instead of the client's, every such client is one client again (Docker's
+  userland proxy does that to IPv6 connections when the Docker network has no IPv6): check the log after a
+  deploy (admin-guide §5.5). An IPv6 client is counted by its full address, not by its /64. The counters live
+  in web's memory: a restart of web clears them.
+- **Sign-in's limit is not a decorator.** `grep limiter.limit` does not find it: `login` calls
+  `rate_limit.count_login_attempt`, which keeps two counters, per address and account (10/15minute) and per
+  address (20/15minute). None is per account alone, or attempts made from elsewhere would lock an account's
+  owner out; and the address's counter is read first but counted last, so that an account that keeps failing
+  does not use up the allowance of the other people behind the same address. Keep that order.
 - **The config cache is per-process, so the worker lags the web UI by up to 30 s.** `invalidate_cache()`
   only clears the calling process's dict; the worker container picks up a changed
   `REBUILD_DEBOUNCE_SECONDS` on its own TTL refresh. And `apply_patch` only `flush()`es — the route
@@ -2044,7 +2075,8 @@ Rate limits, all on `/api/auth/*` and nowhere else: `register-request` 5/hour,
   `app/main.py` module scope, which is the correct place — the instrumentations must wrap the app and
   engine objects before either handles work.
 - **`/metrics`, `/healthz*` and `/static/*` are excluded from HTTP metrics and from traces**
-  (`_EXCLUDED_HANDLER_PATTERNS`, `excluded_urls`), along with `/api/auth/proxy-validate`. Unmatched
+  (`_EXCLUDED_HANDLER_PATTERNS`, `excluded_urls`), along with `/api/auth/proxy-validate` (a pattern, so
+  `/api/auth/proxy-validate-admin` too; traces only, both are counted in the HTTP metrics). Unmatched
   URLs are bucketed as `<unmatched>` so probe traffic can't create a label per garbage path.
 - **Tracing is off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set.** Every tracing entry point
   short-circuits on the empty env var, which is what keeps the test suite from dialling `tempo:4317`.

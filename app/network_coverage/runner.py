@@ -199,6 +199,10 @@ _DEFAULT_VERIFY_SLEEP_BETWEEN_MS = 500
 # cells): of the directions where VIATOR had journeys after ÖBB's last
 # connection, 3 pages cover 72 %, 4 pages 83 % (median need 2.2 pages).
 _DEFAULT_VERIFY_MAX_PAGES = 3
+# Pairs in a row that may fail on a connection error, after their retries,
+# before a single-session run is stopped and marked failed: its engine stopped
+# answering (COVERAGE_ENGINE_DOWN_PAIRS, 0 = never). See `_count_pair_outcome`.
+_DEFAULT_ENGINE_DOWN_PAIRS = 10
 # A cell's pages share this many times COVERAGE_VERIFY_TIMEOUT_S, counted from
 # its first request (the ratio `/journey`'s paging uses: HAFAS_TIMEOUT_MS a
 # page, twice it in all). A slow ÖBB is then asked no further page.
@@ -267,6 +271,9 @@ class CoverageConfig:
     verify_timeout_s: float = _DEFAULT_VERIFY_TIMEOUT_S
     verify_sleep_ms: int = _DEFAULT_VERIFY_SLEEP_BETWEEN_MS
     verify_max_pages: int = _DEFAULT_VERIFY_MAX_PAGES
+    # Stops a run whose engine stopped answering (`_count_pair_outcome`). A run frozen
+    # before the setting existed takes this default on a resume.
+    engine_down_pairs: int = _DEFAULT_ENGINE_DOWN_PAIRS
     # PR-3 — K-slot time-slicing.
     slot_count: int = _DEFAULT_SLOT_COUNT
     num_itineraries_per_slot: int = _DEFAULT_NUM_ITINERARIES_PER_SLOT
@@ -328,6 +335,7 @@ def _load_coverage_config(db: DbSession) -> CoverageConfig:
         verify_timeout_s=float(cfg.get("COVERAGE_VERIFY_TIMEOUT_S", _DEFAULT_VERIFY_TIMEOUT_S)),
         verify_sleep_ms=int(cfg.get("COVERAGE_VERIFY_SLEEP_MS", _DEFAULT_VERIFY_SLEEP_BETWEEN_MS)),
         verify_max_pages=int(cfg.get("COVERAGE_VERIFY_MAX_PAGES", _DEFAULT_VERIFY_MAX_PAGES)),
+        engine_down_pairs=int(cfg.get("COVERAGE_ENGINE_DOWN_PAIRS", _DEFAULT_ENGINE_DOWN_PAIRS)),
         # PR-3 — K-slot + day-window + timezone defaults.
         slot_count=int(cfg.get("COVERAGE_SLOT_COUNT", _DEFAULT_SLOT_COUNT)),
         num_itineraries_per_slot=int(
@@ -1829,6 +1837,11 @@ async def execute_run(run_id: uuid.UUID, *, executor_id: str | None = None) -> N
     result yet. `executor_id=None` (tests) skips the claim checks. Raises
     `RunNeedsResume` when the run must be resumed rather than ended.
 
+    Before its pairs, each engine the run asks must answer, and in
+    single-session mode a run whose engine stops answering is stopped: both
+    end the run failed with a readable reason (`_check_engines_before_pairs`,
+    `_count_pair_outcome`).
+
     PR-1 — wraps the whole body in try/finally so the cancel-event
     registration set by `register_cancel(run_id)` is always cleared, even
     when execute_run exits via an exception, early-return, or terminal-
@@ -1842,7 +1855,11 @@ async def execute_run(run_id: uuid.UUID, *, executor_id: str | None = None) -> N
         if snap is None or not snap.pairs:
             log.error("run %s has no pairs to execute", run_id)
             return
+        if not await _check_engines_before_pairs(run_id, snap, executor_id):
+            return
         if not await _run_pairs(run_id, snap, executor_id):
+            return
+        if await _stopped_for_engine_down(run_id, executor_id):
             return
 
         if executor_id is not None and not is_cancelled(run_id):
@@ -1888,6 +1905,8 @@ async def execute_run(run_id: uuid.UUID, *, executor_id: str | None = None) -> N
         clear_cancel(run_id)
         _STOP_REQUESTED_IN_DB.discard(run_id)
         _ABANDONED.discard(run_id)
+        _UNREACHABLE_PAIRS.pop(run_id, None)
+        _ENGINE_DOWN.pop(run_id, None)
 
 
 async def _maybe_run_external_verify_sweep(
@@ -2393,6 +2412,145 @@ async def _call_with_connect_retry[T](
     return await fetch()
 
 
+# ─────────────── engine check: a run never asks a stopped engine ───────────────
+#
+# 2026-11-22/24 — eu19's MOTIS stopped (its container could no longer start)
+# while an AT/DE/FR coverage run was queued on it: the run, and its 7 resumes,
+# asked every pair of a stopped engine and wrote only error cells. A run now
+#   1. checks, before its pairs, that each engine it asks answers
+#      (`_check_engines_before_pairs`), and fails at once with a readable
+#      reason when one does not;
+#   2. in single-session mode, stops and fails when COVERAGE_ENGINE_DOWN_PAIRS
+#      pairs in a row failed on a connection error after their retries
+#      (`_count_pair_outcome`): its engine stopped answering mid-run.
+
+# The check before the pairs: `_ENGINE_PROBE_ATTEMPTS` probes `_ENGINE_PROBE_DELAY_S`
+# apart, so an engine that is restarting (autoheal) has 40 s to come back.
+_ENGINE_PROBE_ATTEMPTS = 3
+_ENGINE_PROBE_DELAY_S = 20.0
+_ENGINE_PROBE_TIMEOUT_S = 10.0
+
+# Per run (single-session mode): the pairs in a row that failed on a connection
+# error, and the reason of a run that `_count_pair_outcome` stopped. Cleared by
+# `execute_run`.
+_UNREACHABLE_PAIRS: dict[uuid.UUID, int] = {}
+_ENGINE_DOWN: dict[uuid.UUID, str] = {}
+
+
+async def _engine_answers(engine: str, session_id: str) -> bool:
+    """True when the session's engine gives an HTTP answer, whatever its status,
+    to the GET its container's health check makes (MOTIS `/`, OTP `/otp/`). A
+    transport error means it does not: the name does not resolve (the container
+    is gone), the connection is refused (it is starting or stopped), or no
+    answer comes within `_ENGINE_PROBE_TIMEOUT_S`."""
+    url = planner_dispatch.planner_for_engine(engine).health_url(session_id)
+    try:
+        async with httpx.AsyncClient(timeout=_ENGINE_PROBE_TIMEOUT_S) as client:
+            await client.get(url)
+    except httpx.TransportError as exc:
+        log.warning(
+            "coverage engine check: %s (%s) did not answer at %s: %s: %s",
+            session_id,
+            engine,
+            url,
+            type(exc).__name__,
+            exc,
+        )
+        return False
+    return True
+
+
+def _engine_targets(snap: _Phase1Snapshot) -> list[tuple[str, str]]:
+    """The (session, engine) of each engine the run asks."""
+    if snap.run_mode == MODE_FANOUT:
+        return [(sid, snap.engine_by_session.get(sid, "otp")) for sid in snap.fanout_session_ids]
+    if snap.session_id_for_pairs is None:
+        return []
+    return [(snap.session_id_for_pairs, snap.engine_for_pairs)]
+
+
+async def _engines_not_answering(run_id: uuid.UUID, snap: _Phase1Snapshot) -> list[tuple[str, str]]:
+    """The run's (session, engine) whose engine still gave no answer after
+    `_ENGINE_PROBE_ATTEMPTS` probes. A Stop of the run during the wait ends it
+    with [] (the pairs then see the Stop and the run is cancelled as usual)."""
+    down = _engine_targets(snap)
+    for attempt in range(_ENGINE_PROBE_ATTEMPTS):
+        if attempt:
+            await asyncio.sleep(_ENGINE_PROBE_DELAY_S)
+            if await _run_stopped(run_id, {}):
+                return []
+        answers = await asyncio.gather(*(_engine_answers(engine, sid) for sid, engine in down))
+        down = [target for target, ok in zip(down, answers, strict=True) if not ok]
+        if not down:
+            return []
+    return down
+
+
+async def _check_engines_before_pairs(
+    run_id: uuid.UUID, snap: _Phase1Snapshot, executor_id: str | None
+) -> bool:
+    """True when each engine the run asks answers, or no pair is left to ask.
+    Otherwise the run is marked failed, naming the sessions whose engine gave
+    no answer (no write when its claim was lost), and False."""
+    if not snap.pairs_to_run():
+        return True
+    down = await _engines_not_answering(run_id, snap)
+    if not down:
+        return True
+    names = ", ".join(f"{sid} ({engine.upper()})" for sid, engine in down)
+    waited = round((_ENGINE_PROBE_ATTEMPTS - 1) * _ENGINE_PROBE_DELAY_S)
+    reason = (
+        f"the routing engine did not answer, so the pairs left were not asked: "
+        f"session{'s' if len(down) > 1 else ''} {names} "
+        f"({_ENGINE_PROBE_ATTEMPTS} checks over {waited} s). Check the session's engine "
+        f"(Sessions page, or docker compose ps on the server), then start a new run."
+    )[:500]
+    log.error("network-coverage run %s not started: %s", run_id, reason)
+    if not is_abandoned(run_id):
+        await _off_loop(_mark_run_failed, run_id, executor_id, reason)
+    return False
+
+
+def _count_pair_outcome(
+    run_id: uuid.UUID, session_id: str, cfg: CoverageConfig, exc: BaseException | None
+) -> None:
+    """Single-session mode: count the run's pairs in a row that failed on a
+    connection error (`_CONNECT_RETRY_EXCEPTIONS`, after `_call_with_connect_retry`'s
+    retries); any other outcome, an answer or another error, starts the count
+    again. At `cfg.engine_down_pairs` (0 = never) the engine has stopped
+    answering: the run is stopped like a Stop click, and `execute_run` marks it
+    failed with the reason kept in `_ENGINE_DOWN`."""
+    if exc is None or not isinstance(exc, _CONNECT_RETRY_EXCEPTIONS):
+        _UNREACHABLE_PAIRS.pop(run_id, None)
+        return
+    if is_cancelled(run_id):
+        return  # already stopped: the errors of its last pairs say nothing more
+    count = _UNREACHABLE_PAIRS.get(run_id, 0) + 1
+    _UNREACHABLE_PAIRS[run_id] = count
+    limit = cfg.engine_down_pairs
+    if limit <= 0 or count < limit:
+        return
+    _ENGINE_DOWN[run_id] = (
+        f"the routing engine of session {session_id} stopped answering: {count} pairs "
+        f"in a row failed on a connection error ({type(exc).__name__}) after their "
+        f"retries, so the run was stopped (COVERAGE_ENGINE_DOWN_PAIRS = {limit}). "
+        f"Check the session's engine, then start a new run."
+    )
+    log.error("network-coverage run %s: %s", run_id, _ENGINE_DOWN[run_id])
+    request_cancel(run_id)
+
+
+async def _stopped_for_engine_down(run_id: uuid.UUID, executor_id: str | None) -> bool:
+    """True when `_count_pair_outcome` stopped the run; it is then marked failed
+    with that reason (no write when its claim was lost)."""
+    reason = _ENGINE_DOWN.get(run_id)
+    if reason is None:
+        return False
+    if not is_abandoned(run_id):
+        await _off_loop(_mark_run_failed, run_id, executor_id, reason)
+    return True
+
+
 async def _execute_pair(
     *,
     run_id: uuid.UUID,
@@ -2462,6 +2620,7 @@ async def _execute_pair(
 
     try:
         raw, trips = await _call_with_connect_retry(_fetch, run_id)
+        _count_pair_outcome(run_id, session_id, cfg, None)
         response_ms = _elapsed_ms(started)
         num_itineraries = len(trips)
         if trips:
@@ -2486,6 +2645,7 @@ async def _execute_pair(
             dest.id,
             error_message,
         )
+        _count_pair_outcome(run_id, session_id, cfg, exc)
 
     # Persist into journey_searches + journey_trips (best-effort, so the
     # click-cell drilldown can reuse the v0.1.26 trip-card UI), then the

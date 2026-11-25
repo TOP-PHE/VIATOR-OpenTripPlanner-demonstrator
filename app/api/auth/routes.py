@@ -25,8 +25,8 @@ from ...auth.grafana_role_map import viator_role_to_grafana
 from ...db import get_db
 from ...db_steps import db_step
 from ...models import PasswordResetToken, User, VerificationToken
-from ...rate_limit import limiter
-from ...security import CurrentUser, client_ip, current_user_jwt
+from ...rate_limit import count_login_attempt, limiter
+from ...security import CurrentUser, client_ip, current_user_jwt, require_platform_admin
 from ...settings import settings
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -238,13 +238,16 @@ def register_confirm(
 
 
 @router.post("/login", response_model=LoginResponse)
-@limiter.limit("20/15minute")
 def login(
     request: Request,
     body: LoginBody,
     response: Response,
     db: Annotated[Session, Depends(get_db)],
 ) -> LoginResponse:
+    # Rate limit: two counters kept by `count_login_attempt` (per client
+    # address and account, per client address), not an `@limiter.limit`.
+    count_login_attempt(request, str(body.email))
+
     user = db.execute(select(User).where(User.email == body.email)).scalar_one_or_none()
 
     if user is None or not passwords.verify_password(body.password, user.password_hash):
@@ -304,28 +307,35 @@ async def me(
     )
 
 
-# Audit-2026-05 #14 Phase 2 — endpoint dedicated to nginx `auth_request`
-# subrequests. Used to gate `/grafana/` and `/prometheus/` behind the same
-# JWT cookie that authenticates the admin UI, then forward the user
-# identity to Grafana via an `X-WEBAUTH-USER` header (Grafana's
-# reverse-proxy SSO pattern). nginx-side wiring is in
+# Audit-2026-05 #14 Phase 2 — endpoints dedicated to nginx `auth_request`
+# subrequests: nginx asks one of them before it serves a proxied location,
+# with the cookie (or bearer token) of the request, and reads the identity
+# from the answer's headers. nginx-side wiring is in
 # `docker/nginx/nginx.conf`.
 #
-# Why a separate endpoint from /me:
+# Two endpoints, one per rule:
+#   - /proxy-validate        any signed-in role. Asked by the locations that
+#                            only need a session, and check the role
+#                            themselves if they need one: the per-session
+#                            engine routes (`sessions_orchestrator`), and
+#                            the station mapping module's include, which
+#                            reads `X-Forwarded-User` and `X-Viator-Role`
+#                            from the answer.
+#   - /proxy-validate-admin  `platform_admin` only. Asked by `/grafana/` and
+#                            `/prometheus/`: the logs, traces and metrics of
+#                            every container are an administrator's to read.
+# Both answer the same headers. Do not narrow the first one to protect a new
+# location: point that location at the second.
+#
+# Why separate endpoints from /me:
 #   - /me returns JSON; nginx auth_request only cares about the response
 #     status code and the response *headers* it can extract via
 #     `auth_request_set`. A dedicated endpoint keeps the response shape
 #     specifically shaped for nginx (empty body, headers carry the data).
-#   - /me is rate-limited; this endpoint isn't (nginx hits it on every
-#     downstream Grafana/Prometheus request, ~scrape-frequency volume).
-@router.get("/proxy-validate", include_in_schema=False)
-async def proxy_validate(
-    user: Annotated[CurrentUser, Depends(current_user_jwt)],
-) -> Response:
-    """nginx auth_request endpoint — returns 200 + identity headers if the
-    JWT cookie is valid, 401 otherwise (via the dependency). The Response
-    headers are picked up by nginx with `auth_request_set` and forwarded
-    to Grafana / Prometheus as `X-WEBAUTH-USER` / `X-Forwarded-User`.
+#   - neither is rate-limited: nginx asks on every proxied request (each
+#     panel of a Grafana dashboard is one).
+def _identity_headers(user: CurrentUser) -> Response:
+    """The 200 nginx reads: who the session is, in headers, no body.
 
     `X-Forwarded-Role` is mapped to Grafana's vocabulary (Admin/Editor/
     Viewer) via `app.auth.grafana_role_map.viator_role_to_grafana` so the
@@ -345,6 +355,27 @@ async def proxy_validate(
             "X-Viator-Role": user.role,
         },
     )
+
+
+@router.get("/proxy-validate", include_in_schema=False)
+async def proxy_validate(
+    user: Annotated[CurrentUser, Depends(current_user_jwt)],
+) -> Response:
+    """nginx auth_request endpoint for any signed-in role: 200 + identity
+    headers if the JWT is valid, 401 otherwise (via the dependency). nginx
+    picks the headers up with `auth_request_set`."""
+    return _identity_headers(user)
+
+
+@router.get("/proxy-validate-admin", include_in_schema=False)
+async def proxy_validate_admin(
+    user: Annotated[CurrentUser, Depends(require_platform_admin)],
+) -> Response:
+    """nginx auth_request endpoint for `/grafana/` and `/prometheus/`: the
+    same answer as `proxy_validate` for a platform administrator, 403 for any
+    other role, 401 without a session (both via the dependency). nginx serves
+    a 403 as it is and sends a 401 to the login page."""
+    return _identity_headers(user)
 
 
 # ────────────────────────── password reset ──────────────────────────

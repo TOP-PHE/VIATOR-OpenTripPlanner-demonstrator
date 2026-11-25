@@ -171,28 +171,43 @@ require_platform_admin = _require_role("platform_admin")
 # ────────────────────────── client IP helper ──────────────────────────
 
 
-def client_ip(request: Request) -> str | None:
-    """Best-effort client IP — respects X-Forwarded-For when present.
+# The header nginx writes itself on every request it passes to web
+# (`proxy_set_header X-Real-IP $remote_addr;` in docker/nginx/nginx.conf): the
+# address of the connection nginx accepted, in place of whatever the client
+# sent under that name.
+PROXY_CLIENT_ADDRESS_HEADER = "X-Real-IP"
 
-    Returns None if the resolved value isn't a valid IP. This guards against
-    two things:
 
-    - FastAPI's TestClient sets `request.client.host` to the literal string
-      `"testclient"` (not an IP). Passing that to a Postgres `inet` column
-      raises `InvalidTextRepresentation`.
-    - Misconfigured proxies / WAFs that occasionally inject non-IP tokens
-      into X-Forwarded-For.
-
-    `audit_events.actor_ip` is `inet NULL`, so dropping a malformed value is
-    correct: better to omit the column than to crash the audit insert and
-    lose the event entirely.
-    """
-    xff = request.headers.get("X-Forwarded-For")
-    raw = xff.split(",")[0].strip() if xff else (request.client.host if request.client else None)
-    if raw is None:
+def _as_ip(raw: str | None) -> str | None:
+    """`raw` in its canonical form when it is an IP address, else None."""
+    if not raw:
         return None
     try:
-        ipaddress.ip_address(raw)
+        return str(ipaddress.ip_address(raw.strip()))
     except ValueError:
         return None
-    return raw
+
+
+def client_ip(request: Request) -> str | None:
+    """The client's address as nginx saw it: the one written in audit events
+    and the one the rate limiter counts by (`rate_limit.client_key`).
+
+    It is nginx's `X-Real-IP`, and the address of the connection itself for a
+    request that carries none (a call made inside the Docker network). It is
+    never read from `X-Forwarded-For`: that header is a list the client can
+    start with any value it likes.
+
+    **What this relies on.** web publishes no port (docker-compose.yml), so the
+    only way in from outside is nginx, which always sets the header. A
+    container of the Docker network can call web directly and send any
+    `X-Real-IP`: those containers are trusted here. If web ever becomes
+    reachable without nginx, or behind a second proxy, this header is the
+    client's to choose again (docs/architecture.md, "Invariants & traps").
+
+    Returns None when neither value is an IP address: `request.client.host`
+    is the literal `"testclient"` under FastAPI's TestClient, and
+    `audit_events.actor_ip` is `inet NULL`, so a value that is not an address
+    is left out rather than failing the audit insert and losing the event.
+    """
+    peer = request.client.host if request.client else None
+    return _as_ip(request.headers.get(PROXY_CLIENT_ADDRESS_HEADER)) or _as_ip(peer)

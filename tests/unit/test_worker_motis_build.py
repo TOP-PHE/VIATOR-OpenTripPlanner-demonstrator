@@ -697,3 +697,50 @@ def test_a_database_error_gives_no_zones(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(worker, "SessionLocal", _down)
     assert _DATASET_TIMEZONES("eu19-transit-motis") == {}
+
+
+@pytest.mark.parametrize("kept", [1, 2, 3])
+def test_a_successful_import_keeps_graph_builds_kept_builds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kept: int
+):
+    """After a success, the session keeps `GRAPH_BUILDS_KEPT` complete builds:
+    the one served and the rollback points before it. Three were always kept,
+    about 57 GB each for the Europe session (2026-11-23)."""
+    from app.settings import settings
+
+    inbox, graphs = tmp_path / "inbox", tmp_path / "graphs"
+    monkeypatch.setattr(settings, "inbox_dir", inbox)
+    monkeypatch.setattr(settings, "graph_dir", graphs)
+    monkeypatch.setattr(settings, "graph_builds_kept", kept)
+    monkeypatch.setattr(worker, "_motis_dataset_timezones", lambda _sid: {})
+    sid = "zz-motis"
+    (inbox / sid / "osm").mkdir(parents=True)
+    (inbox / sid / "osm" / "osm.pbf").write_bytes(b"zz")
+    (inbox / sid / "gtfs").mkdir(parents=True)
+    (inbox / sid / "gtfs" / "zz.zip").write_bytes(b"zz")
+    root = graphs / "motis" / sid
+    for old in ("20261101-000000", "20261102-000000", "20261103-000000"):
+        (root / old).mkdir(parents=True)
+        (root / old / "tt.bin").write_bytes(b"old")
+
+    class _Proc:
+        stdout = "ok"
+        stderr = ""
+        returncode = 0
+
+    def _fake_run(cmd, **_kwargs):
+        staging = graphs / cmd[cmd.index("-w") + 1].partition("/graphs/")[2]
+        if "config" in cmd:
+            (staging / "config.yml").write_text("osm: zz\n")
+        if "import" in cmd:
+            (staging / "tt.bin").write_bytes(b"new")
+        return _Proc()
+
+    monkeypatch.setattr(worker.subprocess, "run", _fake_run)
+    log, ok, path = worker.run_build_motis(session_id=sid)
+    assert ok, log
+
+    builds = sorted(p.name for p in root.iterdir() if p.name[0].isdigit())
+    assert len(builds) == kept
+    assert builds[-1] == Path(path).name  # the new one is always kept
+    assert (root / "current").resolve() == Path(path).resolve()
