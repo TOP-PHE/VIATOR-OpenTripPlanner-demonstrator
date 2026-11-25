@@ -1156,7 +1156,9 @@ CHILD_MEMORY_BYTES = 2 * 1024 * MEGABYTE
 # used the 40 minutes of the time, each child alone on a core of an idle
 # server, so under 16.5 and 32.5 MB/s; in June the same exports unpacked to
 # 23.6 and 58.8 GB, and in late November they carry the next timetable year
-# too. 3 hours read DB's 77.9 GB down to 7 MB/s and SBB's 39.7 GB down to
+# too. Read on one workstation core, June's took 27.7 minutes (SBB's, 14 MB/s)
+# and 28.9 (DB's, 34 MB/s): at those paces November's take some 47 and 38
+# minutes, on the server's core a little more. 3 hours read DB's 77.9 GB down to 7 MB/s and SBB's 39.7 GB down to
 # 4 MB/s; at SBB's pace an export up to some 170 GB, where the readers' own
 # 160 GiB bound stops a pass first. The child works niced, one at a time, in
 # the background (nothing waits for it: the send passes take what is ready,

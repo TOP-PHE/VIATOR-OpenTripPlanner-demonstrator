@@ -4676,7 +4676,10 @@ the extracts changes no graph build.
   (1.99 GB, 77.9 GB) each ran out of the 40 minutes of the time, each
   child alone on a core of an idle server, so they read under 16.5 and
   32.5 MB a second. In June the same exports unpacked to 23.6 and 58.8 GB;
-  in late November they carry the next timetable year too. Hence the
+  in late November they carry the next timetable year too. Read on one
+  workstation core, June's took 27.7 minutes (SBB's, 14 MB a second) and
+  28.9 minutes (DB's, 34 MB a second): at those paces November's take some
+  47 and 38 minutes, on the server a little more. Hence the
   3 hours: they read DB's 77.9 GB down to 7 MB a second and SBB's 39.7 GB
   down to 4 MB a second. A national export can thus take one to two hours
   in the background after its refresh; nothing waits for it (a graph build
