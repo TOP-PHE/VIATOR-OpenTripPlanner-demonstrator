@@ -447,3 +447,16 @@ def test_bad_cap_switch_is_logged(caplog: pytest.LogCaptureFixture) -> None:
 
     assert switch_or_default("ture", True, "otp_serve_mem_cap") is True
     assert "OTP_SERVE_MEM_CAP='ture' is not true or false; using true" in caplog.text
+
+
+def test_motis_build_containers_cap_their_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The json-file driver keeps a container's whole output: a hung import's
+    # log grows for as long as it runs (app/disk_guard.py).
+    _log, seen = _run_motis_build(tmp_path, monkeypatch)
+    assert len(seen) == 2
+    for cmd in seen:
+        assert cmd[cmd.index("--log-opt") + 1] == "max-size=50m"
+        assert "max-file=3" in cmd
+        assert cmd.index("--log-opt") < cmd.index(worker._MOTIS_IMAGE)

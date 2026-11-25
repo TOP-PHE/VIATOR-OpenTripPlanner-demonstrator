@@ -149,7 +149,7 @@ Three details in that picture are easy to get backwards and expensive to debug:
 5. `worker.py::tick()` (every `WORKER_TICK_SECONDS`, default 15) picks the oldest `rebuild_jobs` row at `status='pending'` whose session has no refresh running (`refresh_progress.running_for`), waits out `REBUILD_DEBOUNCE_SECONDS` (default 1800 — so a burst of feed refreshes produces one build), flips it to `running`.
 6. `tick` re-reads `sessions.engine` in its own short transaction and dispatches to `run_build` or `run_build_motis`. `run_build` resolves every per-session knob (`osm_filter.validate_scope`, `osm_geo.validate_countries`, `otp_timezone.validate_timezone`, `otp_heap.validate_heap`, `otp_api_timeout.validate_timeout`, `ingestion.normalize_providers`), decrypts GTFS-RT credentials via `app/credentials.py`, and renders `router-config.json` with `router_config.render_router_config`.
 7. It shells out: `docker compose -p viator run --rm -e OTP_HEAP=… -e OTP_OSM_SCOPE=… otp-build`, cwd `/srv/docker`, via the mounted docker socket (`_DOCKER = "/usr/local/bin/docker"` — a single constant so every subprocess call is auditable). With `max_memory` set it first stops the observability stack and the serving session containers, and restores them in a `finally`.
-8. On success: move `graph.obj` to `graphs/<sid>/<timestamp>/`, repoint `graphs/<sid>/current` as a **relative** symlink, `_prune_old_graphs(keep=3)`.
+8. On success: move `graph.obj` to `graphs/<sid>/<timestamp>/`, repoint `graphs/<sid>/current` as a **relative** symlink, `_prune_old_graphs(keep=GRAPH_BUILDS_KEPT)`.
 9. Back in `tick`: job → `done`; session auto-advances `populated|configured` → `graph_built`; `graph_snapshots.enumerate_session_inputs` walks the inbox computing sha256 from disk (not just the `Upload` table, which misses refresh-from-URL feeds) and `record_snapshot` writes the `graph_snapshots` row. Snapshot failure never flips a successful build to failed.
 10. Operator clicks Promote → `POST /api/sessions/{sid}/promote`: state → `serving`, `sessions_orchestrator.regenerate(db)` rewrites `docker-compose.sessions.yml` + `nginx-sessions.conf`, and touches `/data/generated/.reload-trigger`.
 11. The worker's next tick runs `handle_reload_trigger()`: `docker compose -p viator up -d` (starts `otp-<sid>` / `motis-<sid>`) and `nginx -s reload`, then deletes the trigger. **Eventually consistent** — there is a ≤15 s window where the DB says `serving` but the container isn't routable yet. `main.py::_startup` also calls `sessions_orchestrator.regenerate` at boot to close the drift window after a deploy.
@@ -1037,7 +1037,7 @@ countries with ≥ `SUGGEST_MIN_STOPS` (5).
 
 **Snapshots and promotion.** After a successful build the worker does three separate "promotions".
 (1) *On disk*: `graph.obj` moves to `graphs/<sid>/<timestamp>/`, and `graphs/<sid>/current` is
-repointed as a **relative** symlink (`current -> 20260429-042955`) before `_prune_old_graphs(keep=3)`.
+repointed as a **relative** symlink (`current -> 20260429-042955`) before `_prune_old_graphs(keep=GRAPH_BUILDS_KEPT)`.
 (2) *In the snapshot table*: `enumerate_session_inputs` walks `gtfs/`, `netex/`, `osm/`, streams a
 SHA-256 per file, dedupes by hash, and cross-references the `Upload` table — files with an `Upload`
 row are `source: "uploaded"`, everything else `"refreshed"`. This exists because refresh-from-URL
@@ -1584,7 +1584,7 @@ left alone; dropping a course means dropping the journey meetings that name it, 
 the whole import.
 
 **Promotion.** On success the graph moves to `graphs/<sid>/<timestamp>/`, `current` is
-repointed, and `_prune_old_graphs(keep=3)` runs. Promote (`POST /api/sessions/<sid>/promote`)
+repointed, and `_prune_old_graphs(keep=GRAPH_BUILDS_KEPT)` runs. Promote (`POST /api/sessions/<sid>/promote`)
 sets `serving`, calls `regenerate`, and touches `/data/generated/.reload-trigger`. The worker's
 next `handle_reload_trigger()` runs `docker compose up -d --no-deps <serving services>`, removes
 orphaned OTP services, warns about non-compose containers running the VIATOR OTP image, runs
@@ -1648,6 +1648,15 @@ Heap → cgroup cap derivation (`mem_limit_for_heap` = `heap_gb + max(4, heap_gb
 
 ### Invariants & traps
 
+- **A build must never fill the data disk.** On a full disk postgres and web stop, and the site with
+  them (2026-10-01; 2026-11-23, a hung Europe import holding about 240 GB). `app/disk_guard.py`
+  refuses a build without `BUILD_MIN_FREE_GB` free beyond the session's current build, and the
+  cancel watcher (`_watch_for_cancel`, every 10 s) also asks `disk_guard.stop_reason` and kills
+  the build container under that floor or past `BUILD_MAX_HOURS`, like a cancel; `tick()` writes
+  the reason into the job's log. The import's own output reaches the job log only when it exits:
+  a hung import shows nothing past `/motis import` in the log. A new kind of build container must
+  carry `_build_container_name(job_id)`, or the watcher cannot stop it, and
+  `disk_guard.DOCKER_RUN_LOG_ARGS`, or its log grows without limit.
 - **`graphs/<sid>/current` must be a *relative* symlink.** The volume mounts at different paths
   in the worker (`/data/graphs`) and the serve container (`/var/otp/graph`). An absolute target
   resolves in one namespace only; the serve container dies with "graph.obj: No such file".

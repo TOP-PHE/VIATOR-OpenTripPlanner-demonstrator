@@ -295,3 +295,120 @@ def test_tick_records_a_killed_build_as_cancelled(monkeypatch: pytest.MonkeyPatc
     ]
     assert job.status == "cancelled"
     assert "[viator] cancelled by an operator" in job.log
+
+
+# ── the disk guard (app/disk_guard.py) ─────────────────────────────────
+# A rebuild that would fill the data disk, or runs for longer than any build
+# should, is stopped by the worker like a cancelled one, with the reason in
+# its log. The guard's verdict is a stand-in here.
+
+
+def test_watcher_kills_the_container_once_the_guard_stops_the_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    killed: list[str] = []
+    done = threading.Event()
+    guard = worker._Guard()
+
+    def kill(name: str) -> None:
+        killed.append(name)
+        if len(killed) == 2:  # config, then import: both under the same name
+            done.set()
+
+    monkeypatch.setattr(worker, "_CANCEL_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(worker.disk_guard, "stop_reason", lambda *_a: "the disk is nearly full")
+    monkeypatch.setattr(worker, "_cancel_requested", lambda _jid: False)
+    monkeypatch.setattr(worker, "_kill_container", kill)
+    worker._watch_for_cancel(uuid.uuid4(), "viator-build-x", done, guard)
+
+    assert killed == ["viator-build-x", "viator-build-x"]
+    assert guard.reason == "the disk is nearly full"
+
+
+def test_the_guard_is_asked_with_the_settings_and_the_time_spent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asked: list[tuple[Any, ...]] = []
+    guard = worker._Guard(started=100.0)
+
+    def reason(*args: Any) -> None:
+        asked.append(args)
+
+    monkeypatch.setattr(worker.disk_guard, "stop_reason", reason)
+    monkeypatch.setattr(worker.time, "monotonic", lambda: 160.0)
+    monkeypatch.setattr(worker.settings, "build_min_free_gb", 40)
+    monkeypatch.setattr(worker.settings, "build_max_hours", 6)
+
+    assert worker._guard_stops(guard, uuid.uuid4(), "viator-build-x") is False
+    assert asked == [(Path(str(worker.settings.graph_dir)), 40, 60.0, 6)]
+    assert guard.reason is None
+
+
+def test_tick_writes_why_the_worker_stopped_a_build(monkeypatch: pytest.MonkeyPatch) -> None:
+    job = _job("pending")
+    killed = threading.Event()
+
+    def build(**_kw: Any) -> tuple[str, bool, str]:
+        killed.wait(5)  # the import runs until the watcher kills it
+        return "motis import killed", False, ""
+
+    db = _TickDb(job, claim=job.id)
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+    monkeypatch.setattr(worker, "_debounce_seconds", lambda: 0)
+    monkeypatch.setattr(worker, "_CANCEL_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(worker, "_cancel_requested", lambda _jid: False)
+    monkeypatch.setattr(worker, "_kill_container", lambda _name: killed.set())
+    monkeypatch.setattr(worker.disk_guard, "stop_reason", lambda *_a: "the disk is nearly full")
+    monkeypatch.setattr(worker.disk_guard, "start_refusal", lambda *_a: None)
+    monkeypatch.setattr(worker, "run_build_motis", build)
+    worker.tick()
+
+    assert job.status == "failed"
+    assert "[viator] stopped by the worker: the disk is nearly full" in job.log
+    assert "cancelled by an operator" not in job.log
+
+
+def _engine_build(monkeypatch: pytest.MonkeyPatch, engine: str, refusal: str | None) -> list[Any]:
+    builds: list[Any] = []
+    asked: list[tuple[Any, ...]] = []
+
+    def start_refusal(*args: Any) -> str | None:
+        asked.append(args)
+        return refusal
+
+    monkeypatch.setattr(worker, "_sending_cancelled", lambda *_a: False)
+    monkeypatch.setattr(worker, "_waiting_cancelled", lambda *_a: False)
+    monkeypatch.setattr(worker, "_note_country_warning", lambda *_a: None)
+    monkeypatch.setattr(worker.disk_guard, "start_refusal", start_refusal)
+    monkeypatch.setattr(
+        worker, "run_build_motis", lambda **kw: builds.append(kw) or ("ok", True, "p")
+    )
+    monkeypatch.setattr(worker, "run_build", lambda **kw: builds.append(kw) or ("ok", True, "p"))
+    result = worker._run_engine_build(
+        engine, job_id=uuid.uuid4(), session_id=SID, max_memory=False, container="c"
+    )
+    return [result, builds, asked]
+
+
+def test_a_build_without_room_on_the_disk_is_not_started(monkeypatch: pytest.MonkeyPatch) -> None:
+    (output, success, path), builds, _ = _engine_build(monkeypatch, "motis", "no room")
+
+    assert (output, success, path) == ("[viator] not started: no room\n", False, "")
+    assert builds == []
+
+
+@pytest.mark.parametrize(
+    ("engine", "under"),
+    [("motis", Path("motis") / SID), ("otp", Path(SID))],
+)
+def test_the_room_needed_is_measured_on_the_sessions_own_builds(
+    monkeypatch: pytest.MonkeyPatch, engine: str, under: Path
+) -> None:
+    monkeypatch.setattr(worker.settings, "build_min_free_gb", 25)
+
+    (_, success, _), builds, asked = _engine_build(monkeypatch, engine, None)
+
+    graph_dir = Path(str(worker.settings.graph_dir))
+    assert asked == [(graph_dir, graph_dir / under, 25)]
+    assert success is True
+    assert len(builds) == 1

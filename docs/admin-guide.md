@@ -1109,7 +1109,7 @@ Three things to watch as you onboard more sessions:
 | Watermark | Why it matters | When to act |
 |---|---|---|
 | `viator_pgdata` size | Search history grows; audit log grows | At 50% disk free, set up retention pruning more aggressively (Admin → Configuration) |
-| `viator_graphs-<sid>` count | Each `serving` session keeps `current` + 2 historical graphs | At 80% disk free, drop unused sessions (Admin → Sessions → Delete) |
+| `viator_graphs-<sid>` count | After a successful build each session keeps `GRAPH_BUILDS_KEPT` complete builds (default 2: the one served and one rollback point); a Europe-wide MOTIS build is about 57 GB | At 80% disk free, drop unused sessions (Admin → Sessions → Delete) |
 | Free RAM during a build | OTP build needs `OTP_BUILD_HEAP + ~4 GB` headroom | If a build OOMs, raise `OTP_BUILD_MEM_LIMIT` (≥ heap + 4) OR upgrade VPS RAM. France-wide builds need 32 GB minimum. |
 | Serve working sets | Since #374 each OTP serve container has a cap (serve heap + headroom, §5.8). A cap is a ceiling, not a reservation: a router uses what its graph needs, usually well under its cap | Size the host on the typical working sets ("Container memory" panel, a few days) of the serving sessions plus the largest build cap, with a margin; not on the sum of the caps. "Swap by container" shows who swaps |
 
@@ -1127,9 +1127,40 @@ space each session takes (graphs, feeds and OSM), and a list of what can be dele
 
 The build a session serves (`current`), live feeds and OSM files, and everything of a session whose
 rebuild is running are never listed. Deletion re-checks each item first and is recorded in the audit
-log (`storage.cleanup`). Docker images are not covered: on the host, `docker image prune` or remove
-old `viator-web` / `viator-otp` tags. Since PR #283 a failed build deletes its own folder; before it,
-failed Europe imports filled the disk on 2026-10-01 and took the site down.
+log (`storage.cleanup`). Docker images are not listed: each deploy removes the images no container
+uses that are older than 14 days (`bin/viator-deploy.sh`); on the host, `docker image prune -a`
+removes every unused one. Since PR #283 a failed build deletes its own folder; before it, failed
+Europe imports filled the disk on 2026-10-01 and took the site down.
+
+A rebuild marked *running* for hours keeps its session out of this list. If no `viator-build-<job>`
+container is running on the host (`docker ps --filter name=^viator-build-`), restart the worker
+(`docker compose -p viator restart worker`): it marks such a job failed at start-up, and the page
+lists the session's builds again.
+
+#### The disk during a rebuild
+
+A full data disk takes the whole site down: postgres can no longer write, web stops answering, and
+a deploy stops half way. On 2026-11-23 a MOTIS import of the Europe session hung for 20 hours and
+held about 240 GB when it was stopped, for a graph that is about 57 GB once built. The worker now
+guards the disk itself (`app/disk_guard.py`), with three settings of `docker/.env`, read by the
+worker:
+
+| Setting | Default | Effect |
+|---|---|---|
+| `BUILD_MIN_FREE_GB` | `30` | A rebuild does not start unless the disk has this much free beyond the size of the session's current build. A running rebuild is stopped as soon as the free space falls under it. `0` turns both checks off. |
+| `BUILD_MAX_HOURS` | `12` | A rebuild still running this many hours after it started (waits for the station module included) is stopped. `0` = no limit. |
+| `GRAPH_BUILDS_KEPT` | `2` | Complete builds kept per session after a successful build. `3` was the fixed number before. |
+
+A rebuild stopped this way ends `failed`, its incomplete folder is deleted, and the served build is
+untouched; its log ends with `[viator] stopped by the worker: …` or begins with `[viator] not
+started: …`, saying which limit and how much was free. Free space (Admin → Storage) and run it
+again; raise `BUILD_MAX_HOURS` only if a sound build really takes longer. The settings are read
+when the worker starts: `docker compose -p viator up -d worker` after editing `.env`.
+
+Every container's log is capped to 3 files of 50 MB: the services of `docker-compose.yml`, the
+per-session routers and the build containers. A deploy first checks that the disk of
+`/opt/viator` and of `/var/lib/docker` has 10 GB free, and stops with exit code 6 before changing
+anything otherwise.
 
 ### 5.7 Watching a refresh (issue #359)
 
