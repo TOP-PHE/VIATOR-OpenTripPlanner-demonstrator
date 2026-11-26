@@ -455,7 +455,7 @@ def test_the_patch_loads_and_answers_within_the_extract_budget():
     assert time.perf_counter() - start < 1.0  # measured ~0.03-0.07 s
     # Positions by v1 borders, the slowest kind (the patch then measures the
     # distance to the neighbour's line): ~1 ms each, so 100,000 stops cost
-    # under a few minutes of the extract child's 40 min of CPU.
+    # a few minutes of the extract child's processor time.
     positions = [
         (47.659, 9.177), (43.353, -1.7836), (45.832, 9.031), (51.364, 6.172),
         (68.425, 18.13), (49.47, 6.364), (50.562, 6.219), (54.835, 9.50),

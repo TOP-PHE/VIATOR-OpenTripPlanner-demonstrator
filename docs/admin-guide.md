@@ -4656,8 +4656,9 @@ the extracts changes no graph build.
   either.
 - **How, safely.** Each extraction runs in a separate child process of the
   `web` container, one at a time on the server, with at most 2 GiB of
-  memory, 40 minutes of processor time and 45 minutes in all, at a lower
-  priority, and it dies with the web process. A broken, hostile or oversized
+  memory, 3 hours of processor time and 4 hours in all (40 and 45 minutes
+  before 25 November 2026), at a lower priority, and it dies with the web
+  process. A broken, hostile or oversized
   archive can only end that child: the log says which limit it passed
   (`reason=memory_limit`, `cpu_limit` or `wall_clock_limit`, see "Which
   limit, and what to do" below; or `input_too_large`) and the web process
@@ -4669,12 +4670,25 @@ the extracts changes no graph build.
   about 60 MB of unpacked XML a second (the passing times, calendars and
   links, most of the bytes, are skipped without being parsed), a GTFS at
   about 0.7 million stop times a second (measured on synthetic national
-  shapes, one core; `scripts/bench_station_extract.py`). So a national
-  NeTEx of 2 GB zipped (some 40 GB unpacked) takes about 11 minutes, a
-  GTFS of 100 million stop times under 3; memory stays at a few hundred
-  MiB. The extracts are made from the smallest timetable file to the
+  shapes, one core; `scripts/bench_station_extract.py`); memory stays at a
+  few hundred MiB. **Real national NeTEx exports read slower**: on
+  25 November 2026 SBB's (0.68 GB zipped, 39.7 GB unpacked) and DB's
+  (1.99 GB, 77.9 GB) each ran out of the 40 minutes of the time, each
+  child alone on a core of an idle server, so they read under 16.5 and
+  32.5 MB a second. In June the same exports unpacked to 23.6 and 58.8 GB;
+  in late November they carry the next timetable year too. Read on one
+  workstation core, June's took 27.7 minutes (SBB's, 14 MB a second) and
+  28.9 minutes (DB's, 34 MB a second): at those paces November's take some
+  47 and 38 minutes, on the server a little more. Hence the
+  3 hours: they read DB's 77.9 GB down to 7 MB a second and SBB's 39.7 GB
+  down to 4 MB a second. A national export can thus take one to two hours
+  in the background after its refresh; nothing waits for it (a graph build
+  takes only the extracts already made, the refresh's pass sends it when it
+  is ready). The extracts are made from the smallest timetable file to the
   largest, so the small feeds of a session are ready within minutes of a
-  refresh, before the national ones.
+  refresh, before the national ones; while a national one is being made,
+  another feed's extraction (a provider card's refresh, an upload) waits
+  for it.
 - **Memory of the `web` container (a proposal for the owner, not set by
   this release).** The `web` service has no `mem_limit` today. The
   extraction adds at most its 2 GiB cap to what `web` already uses (peaks
@@ -4754,11 +4768,13 @@ the extracts changes no graph build.
     the limit, report it (a reader to fix). It is remembered: the same file
     is not read again until a new file, or a VIATOR release changing the
     reader, which retries it at the next refresh with nothing to delete.
-  - `cpu_limit` — more than 40 minutes of processor time (a national NeTEx
-    reads at some 25 to 60 MB of XML a second, so this means some 60 GB
-    unpacked or more, or a reader fault). Remembered, like `memory_limit`.
-    Report it with the file size.
-  - `wall_clock_limit` — 45 minutes in all, before the processor time ran
+  - `cpu_limit` — more than 3 hours of processor time (SBB's national
+    NeTEx read under 16.5 MB of XML a second on 25 November 2026, so at
+    that pace this means some 170 GB unpacked or more, past the readers'
+    own 160 GiB bound, or a reader fault). Remembered, like `memory_limit`. Report it with the
+    file size, zipped and unpacked (the sum of the sizes the zip's
+    directory gives its members).
+  - `wall_clock_limit` — 4 hours in all, before the processor time ran
     out: the server was busy (a graph build at the same time). Tried once
     more at the next pass; remembered only the second time in a row. If it
     stays, refresh again at a quiet time.
@@ -4827,8 +4843,17 @@ the extracts changes no graph build.
   readers' code changed, so every remembered failure (`no_rail_stop`,
   `memory_limit`, `cpu_limit`, …) counts no longer and each such feed is
   read again once, one at a time in the background; a large national
-  NeTEx can hold the extraction child up to 45 minutes. Extracts already
+  NeTEx can hold the extraction child up to 4 hours. Extracts already
   made and cached are not made again (`EXTRACTOR_VERSION` is unchanged).
+- **After the release of 25 November 2026 (3 hours of processor time):
+  SBB and DB again.** The limits changed, so every remembered failure
+  counts no longer, `cpu_limit` included: the next Refresh of the session
+  (or of the SBB and DB cards) reads those two exports again, one after
+  the other, nothing to delete by hand. Expect each to take one to two
+  hours in the background: the refresh block's station-module pass runs
+  until both are sent. The other feeds whose failure was remembered
+  (`no_rail_stop`, …) are read again once too, a few seconds to minutes
+  each.
 - **NeTEx exports that put a Quay id in `StopPlaceRef`.** Some exports
   (the Belgian one, for one) give each stop assignment a `StopPlaceRef`
   that names a Quay, not a StopPlace, and no `QuayRef`. The extractor reads

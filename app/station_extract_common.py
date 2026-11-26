@@ -28,9 +28,10 @@ to some 40 GB, a GTFS `stop_times.txt` to several GB):
   bytes of the whole archive (64 MiB at least), so that many small members
   cannot each use the floor;
 - a member and one reading pass at most 160 GiB (`MEMBER_MAX_BYTES`,
-  `ARCHIVE_MAX_BYTES`): a national NeTEx of 2 GB zipped packing 33 times is
-  some 66 GB, and the child reads about 60 MB/s, so its 40 minutes of
-  processor time end near 150 GB anyway.
+  `ARCHIVE_MAX_BYTES`): DB's national NeTEx of 2 GB zipped packs 39 times,
+  77.9 GB (25 November 2026); at SBB's pace that day (under 16.5 MB/s) the
+  child's 3 hours of processor time end near 170 GB, at the synthetic
+  60 MB/s near 650 GB: this bound stops the largest first.
 
 The members a reader never reads (a PDF, a readme beside the timetable) are
 never checked. Every bound is checked first on the sizes the zip's central

@@ -789,7 +789,8 @@ WALL_CLOCK = "wall-clock time"
 # time; a crash under a passing memory shortage may not) is remembered only
 # the second time in a row with the same reason (`TRIES`, `COUNTED_REASONS`;
 # a child that fails otherwise in between starts the count again), so that a
-# national archive does not hold the machine 45 minutes at every pass.
+# national archive does not hold the machine its whole wall clock at every
+# pass.
 # `busy`, `cache` and `error` are never remembered.
 REMEMBERED_REASONS = frozenset(
     {
@@ -1147,17 +1148,29 @@ CHILD_MEMORY_BYTES = 2 * 1024 * MEGABYTE
 # 15 October, which spent the 2 GiB near 1.6 million of them); a crafted
 # file reaching all its caps at once would still pass 2 GiB, and ends
 # `memory_limit` (`station_extract_netex`, "Memory").
-# Processor time (`scripts/
-# bench_station_extract.py`, one core): NeTEx at about 60 MB/s, so a national
-# archive of 2 GB zipped (some 40 GB unpacked) takes about 11 minutes, 17 if
-# it packs 30 times; GTFS at about 0.7 million stop times a second, so
-# 100 million take under 3 minutes. 40 minutes leave twice the slowest of
-# those on a slower core; the child works niced, one at a time, in the
-# background (nothing waits for it: the send passes take what is ready), so
-# its wall clock is 45 minutes. A child past its processor time fails the
-# same way again (remembered, `REMEMBERED_REASONS`), so the margin matters.
-CHILD_CPU_SECONDS = 40 * 60
-CHILD_WALL_SECONDS = 45 * 60
+# Processor time. The synthetic national shapes of `scripts/
+# bench_station_extract.py` (one core) read NeTEx at about 60 MB/s and GTFS
+# at about 0.7 million stop times a second (100 million in under 3 minutes).
+# Real national NeTEx exports read slower: in production on 25 November 2026
+# SBB's (0.68 GB zipped, 39.7 GB unpacked) and DB's (1.99 GB, 77.9 GB) each
+# used the 40 minutes of the time, each child alone on a core of an idle
+# server, so under 16.5 and 32.5 MB/s; in June the same exports unpacked to
+# 23.6 and 58.8 GB, and in late November they carry the next timetable year
+# too. Read on one workstation core, June's took 27.7 minutes (SBB's, 14 MB/s)
+# and 28.9 (DB's, 34 MB/s): at those paces November's take some 47 and 38
+# minutes, on the server's core a little more. 3 hours read DB's 77.9 GB down to 7 MB/s and SBB's 39.7 GB down to
+# 4 MB/s; at SBB's pace an export up to some 170 GB, where the readers' own
+# 160 GiB bound stops a pass first. The child works niced, one at a time, in
+# the background (nothing waits for it: the send passes take what is ready,
+# a graph build takes only cached extracts), so its wall clock is an hour
+# more, for a server busy with a graph build. A refresh's pass waits for
+# every feed under a 12-hour ceiling
+# (`station_extract_upload.REFRESH_BUDGET_SECONDS`): two national exports at
+# their wall clock and every other feed still fit in it. A child past its
+# processor time fails the same way again (remembered, `REMEMBERED_REASONS`),
+# so the margin matters.
+CHILD_CPU_SECONDS = 180 * 60
+CHILD_WALL_SECONDS = 240 * 60
 CHILD_NICE = 10
 # How long `ensure_extract` waits for another extraction to end by default.
 WAIT_SECONDS = CHILD_WALL_SECONDS + 60

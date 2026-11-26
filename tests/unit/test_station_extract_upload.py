@@ -1006,8 +1006,8 @@ def test_the_admin_text(
     ("reason", "words"),
     [
         ("memory_limit", "memory limit (2 GiB)"),
-        ("cpu_limit", "processor-time limit (40 minutes)"),
-        ("wall_clock_limit", "wall-clock limit (45 minutes)"),
+        ("cpu_limit", "processor-time limit (180 minutes)"),
+        ("wall_clock_limit", "wall-clock limit (240 minutes)"),
         ("stopped", "killed from outside"),
         ("crashed", "crashed"),
         ("resource_limit", "memory or time limit"),  # recorded by an earlier release

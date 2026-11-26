@@ -1100,8 +1100,8 @@ archive_sha256, *, extracted_at, session_id, cache_dir=None, wait_seconds=None, 
 ExtractResult(path_gz,
 feed_key, feed_version, extractor_version, rows, bytes, body_sha256, dropped)`**: a valid cached
 extract comes back at once; otherwise the extraction runs in a *spawned* child process with 2 GiB of
-address space (`RLIMIT_AS`), 40 minutes of processor time (`RLIMIT_CPU`), 45 minutes of wall-clock
-time, `nice 10` and `PR_SET_PDEATHSIG`, one at a time on the machine (a thread lock plus an `flock` on
+address space (`RLIMIT_AS`), 3 hours of processor time (`RLIMIT_CPU`; 40 minutes before 25 November
+2026), 4 hours of wall-clock time, `nice 10` and `PR_SET_PDEATHSIG`, one at a time on the machine (a thread lock plus an `flock` on
 `inbox/.station-extract.lock`, which `web` and `worker` share; `busy` past the wait). A hostile or
 huge archive can only end the child, with the word of the limit it passed (`memory_limit`,
 `cpu_limit`, `wall_clock_limit`; `stopped` for SIGKILL, SIGTERM, SIGINT or SIGHUP from outside,
@@ -1176,7 +1176,8 @@ cost processor time, not disk or memory: the bounds stop a zip bomb early (a mem
 200 times its packed size, where timetable XML and CSV pack 5 to 30 times and only a crafted member
 nears deflate's 1,000, and the members read together at 200 times the whole archive; refused from
 the central directory before a byte is read) and accept a national feed (160 GiB a member and a pass:
-a 2 GB NeTEx packing 33 times is some 66 GB, and at 60 MB/s the child's 40 minutes end near 150 GB);
+DB's 2 GB NeTEx packs 39 times, 77.9 GB, and at SBB's pace (under 16.5 MB/s) the child's 3 hours end
+near 170 GB, at the synthetic 60 MB/s near 650 GB);
 the child's processor time is the last stop. The filter's searches inside a dropped element are each
 made once over a stretch of a chunk, so hostile markup there (many comments, processing instructions,
 nested self-closing tags) costs a few MB/s, as much as expat's own parsing of dense markup, never
@@ -1194,8 +1195,14 @@ splits text blocks in C (`str.splitlines` on a block with none of its extra line
 those of the former reader (a test re-states it). Measured (`scripts/bench_station_extract.py`, one
 core, synthetic national shapes): NeTEx of 4 GB unpacked with 200,000 StopPlaces 67 s (60 MB/s,
 before 304 s), peak RSS 198 MiB; GTFS of 40 million stop times 57 s (0.7 million rows a second,
-before 127 s), peak RSS 100 MiB. A 2 GB national NeTEx (~40 GB) takes about 11 minutes, a 100-million
-GTFS under 3: hence the child's 40 minutes of processor time and 45 of wall clock.
+before 127 s), peak RSS 100 MiB. Real national NeTEx exports read slower than the synthetic shapes: on
+25 November 2026 SBB's (39.7 GB unpacked) and DB's (77.9 GB) each used the then 40 minutes of
+processor time, each child alone on a core of an idle server, so under 16.5 and 32.5 MB/s (the same
+exports unpacked to 23.6 and 58.8 GB in June; in late November they carry the next timetable year).
+Hence the child's 3 hours of processor time (DB down to 7 MB/s, SBB down to 4 MB/s) and an hour more
+of wall clock for a niced child on a server busy with a graph build; a refresh's pass, which waits
+for every feed under its 12-hour ceiling (`station_extract_upload.REFRESH_BUDGET_SECONDS`), still
+holds two national exports at their wall clock (tests in `test_station_extract_bounds.py`).
 
 **Stop extract: memory of the NeTEx reader** (production, 15 October: two national NeTEx archives
 stopped at the child's limit while a larger one passed: the shape, not the size). An export may give every journey its own pattern and its own scheduled stop points,
